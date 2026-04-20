@@ -195,4 +195,4 @@ pyrightconfig.json
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python
 
 # API Keys
-Keys/projects_api_keys.py
+keys/projects_api_keys.py
