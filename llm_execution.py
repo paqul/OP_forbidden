@@ -47,16 +47,6 @@ def run():
                     "name": function_name,
                     "content": json.dumps(function_response)
                 })
-        
-        # # Get final response from GPT after function execution
-        # print("Getting final response from GPT...\n")
-        # final_response = client.chat.completions.create(
-        #     model="gpt-4o-mini",
-        #     messages=messages
-        # )
-        
-        # answer_clear = final_response.choices[0].message.content
-        # print(f"GPT Response:\n{answer_clear}")
     else:
         answer_clear = response_message.content
         print(f"GPT Response:\n{answer_clear}")
