@@ -2,7 +2,18 @@ from keys.projects_api_keys import open_ai_api_key
 from prompts.system_prompts import gpt_system_prompt
 from openai import OpenAI
 import json
+import time
 import tools
+from logger.logger_file import (
+    log_user_request,
+    log_gpt_request,
+    log_gpt_response,
+    log_tool_call_start,
+    log_tool_call_result,
+    log_final_response,
+    log_error,
+    log_session_summary
+)
 
 client = OpenAI(api_key=open_ai_api_key)
 
@@ -16,40 +27,112 @@ available_functions = {
 }
 
 def run():
-    messages = [
-        {"role": "system", "content": gpt_system_prompt},
-        {"role": "user", "content": "Can you list all available VPN servers in the US East region and tell me which one has the lowest load?"}
-    ]
-    
-    print("Sending request to GPT with VPN tools...")
-    gpt_response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=messages,
-        tools=tools.tools,
-        tool_choice="auto"
-    )
-    response_message = gpt_response.choices[0].message
-    tool_calls = response_message.tool_calls
-    messages.append(response_message)
-    
-    if tool_calls:
-        print(f"\nGPT is calling {len(tool_calls)} tool(s)...\n")
-        for tool_call in tool_calls:
-            function_name = tool_call.function.name
-            function_args = json.loads(tool_call.function.arguments)
-            print(f"Executing: {function_name}({function_args})")
-            if function_name in available_functions:
-                function_response = available_functions[function_name](**function_args)
-                print(f"Result: {json.dumps(function_response, indent=2)}\n")
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": json.dumps(function_response)
-                })
-    else:
-        answer_clear = response_message.content
-        print(f"GPT Response:\n{answer_clear}")
-    
-    print("\n" + "="*50)
-    print("LLM Execution completed.")
+    """Execute LLM with VPN tools and comprehensive logging."""
+    try:
+        # Define user message
+        user_message = "Can you list all available VPN servers in any region and try connecting to one of them? Also, check the connection info after connecting."
+        
+        # Log user request
+        log_user_request(user_message)
+        
+        messages = [
+            {"role": "system", "content": gpt_system_prompt},
+            {"role": "user", "content": user_message}
+        ]
+        
+        # Log GPT request
+        model_name = "gpt-4o-mini"
+        log_gpt_request(messages, model_name, tools.tools)
+        
+        print("Sending request to GPT with VPN tools...")
+        gpt_response = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            tools=tools.tools,
+            tool_choice="auto"
+        )
+        
+        response_message = gpt_response.choices[0].message
+        finish_reason = gpt_response.choices[0].finish_reason
+        tool_calls = response_message.tool_calls
+        
+        # Log GPT response
+        log_gpt_response(response_message, finish_reason)
+        
+        messages.append(response_message)
+        
+        tool_call_count = 0
+        
+        if tool_calls:
+            print(f"\nGPT is calling {len(tool_calls)} tool(s)...\n")
+            
+            for tool_call in tool_calls:
+                function_name = tool_call.function.name
+                function_args = json.loads(tool_call.function.arguments)
+                
+                # Log tool call start
+                log_tool_call_start(function_name, function_args)
+                
+                print(f"Executing: {function_name}({function_args})")
+                
+                if function_name in available_functions:
+                    # Execute tool with timing
+                    start_time = time.time()
+                    
+                    try:
+                        function_response = available_functions[function_name](**function_args)
+                        execution_time = time.time() - start_time
+                        
+                        # Log tool call result
+                        log_tool_call_result(function_name, function_response, execution_time)
+                        
+                        print(f"Result: {json.dumps(function_response, indent=2)}\n")
+                        
+                        messages.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": function_name,
+                            "content": json.dumps(function_response)
+                        })
+                        
+                        tool_call_count += 1
+                        
+                    except Exception as e:
+                        log_error(f"Tool execution failed: {function_name}", e)
+                        print(f"ERROR executing {function_name}: {str(e)}\n")
+                else:
+                    error_msg = f"Function {function_name} not found in available_functions"
+                    log_error(error_msg)
+                    print(f"ERROR: {error_msg}\n")
+            
+            # Get final response from GPT after tool execution
+            print("Getting final response from GPT...")
+            log_gpt_request(messages, model_name, tools.tools)
+            
+            second_response = client.chat.completions.create(
+                model=model_name,
+                messages=messages
+            )
+            
+            final_message = second_response.choices[0].message
+            log_gpt_response(final_message, second_response.choices[0].finish_reason)
+            
+            if final_message.content:
+                log_final_response(final_message.content)
+                print(f"\nFinal GPT Response:\n{final_message.content}")
+        else:
+            # No tool calls, direct response
+            answer_clear = response_message.content
+            log_final_response(answer_clear)
+            print(f"GPT Response:\n{answer_clear}")
+        
+        print("\n" + "="*50)
+        print("LLM Execution completed.")
+        
+        # Log session summary
+        log_session_summary(total_requests=1, total_tools=tool_call_count)
+        
+    except Exception as e:
+        log_error("LLM Execution failed", e)
+        print(f"\n❌ CRITICAL ERROR: {str(e)}")
+        raise
