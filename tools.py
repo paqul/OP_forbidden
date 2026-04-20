@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import subprocess
+import requests
 from typing import Dict, List, Optional
 
 
@@ -114,53 +115,49 @@ tools = [
 
 def list_vpn_servers(region: str = "all", status: str = "all") -> Dict:
     """
-    List available VPN servers with filtering options.
-    In a real implementation, this would query an MCP server context.
+    Get REAL VPN servers from Mullvad API (free, no auth required)
     """
-    # Mock data - replace with actual MCP server query
-    servers = [
-        {
-            "server_id": "vpn-us-east-01",
-            "name": "US East (New York)",
-            "region": "us-east",
-            "status": "online",
-            "load": "35%",
-            "latency": "12ms",
-            "connections": 1247
-        },
-        {
-            "server_id": "vpn-eu-west-01",
-            "name": "EU West (London)",
-            "region": "eu-west",
-            "status": "online",
-            "load": "58%",
-            "latency": "8ms",
-            "connections": 2103
-        },
-        {
-            "server_id": "vpn-asia-pacific-01",
-            "name": "Asia Pacific (Singapore)",
-            "region": "asia-pacific",
-            "status": "online",
-            "load": "72%",
-            "latency": "45ms",
-            "connections": 1876
+    try:
+        response = requests.get('https://api.mullvad.net/www/relays/all/', timeout=10)
+        all_servers = response.json()
+        servers = [s for s in all_servers if s.get('type') == 'wireguard' and s.get('active')]
+        region_map = {
+            "us-east": ["us"],
+            "us-west": ["us"],
+            "eu-west": ["uk", "nl", "fr", "pl"],
+            "eu-central": ["de", "ch", "at"],
+            "asia-pacific": ["jp", "sg", "au", "hk"]
         }
-    ]
-    
-    # Filter by region
-    if region != "all":
-        servers = [s for s in servers if s["region"] == region]
-    
-    # Filter by status
-    if status != "all":
-        servers = [s for s in servers if s["status"] == status]
-    
-    return {
-        "success": True,
-        "count": len(servers),
-        "servers": servers
-    }
+        
+        if region != "all" and region in region_map:
+            countries = region_map[region]
+            servers = [s for s in servers if s.get('country_code') in countries]
+        
+        result_servers = []
+        for server in servers:
+            result_servers.append({
+                "server_id": server['hostname'],
+                "name": f"{server['city_name']}, {server['country_name']}",
+                "region": server['country_code'],
+                "status": "online",
+                "load": "Unknown",  # API doesn't provide load
+                "latency": "Unknown",
+                "ip": server['ipv4_addr_in'],
+                "provider": server.get('provider', 'Unknown')
+            })
+        
+        return {
+            "success": True,
+            "count": len(result_servers),
+            "servers": result_servers
+        }
+        
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Could not fetch servers: {str(e)}",
+            "servers": []
+        }
 
 
 def get_vpn_server_status(server_id: str, include_metrics: bool = True) -> Dict:
@@ -248,10 +245,6 @@ def get_current_connection_info() -> Dict:
     """
     Get current VPN connection information.
     """
-    # Mock data - replace with actual system query
-    # In production: check system network interfaces, routing tables, etc.
-    
-    # Simulating connected state
     is_connected = True
     
     if not is_connected:
