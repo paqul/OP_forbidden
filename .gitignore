@@ -194,5 +194,9 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python
 
-# API Keys
+# API Keys and Credentials
 keys/projects_api_keys.py
+vpns/vpn_config.py
+
+# WireGuard VPN Configurations (may contain private keys)
+*.conf

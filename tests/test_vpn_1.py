@@ -41,7 +41,7 @@ def test_wireguard_installation():
 
 def test_list_vpn_servers():
     """Test 2: List available VPN servers."""
-    servers = list_vpn_servers(region="eu-west")  # Get European servers
+    servers = list_vpn_servers(region="all")  # Get European servers
     print_json(servers, f"Test 2: Available VPN Servers (Found {servers.get('count', 0)})")
     return servers
 
@@ -86,7 +86,9 @@ def test_connect_disconnect(server_id):
     # Connect
     connect_result = connect_to_vpn(server_id)
     print_json(connect_result, "")
-    
+
+    print_json(get_current_connection_info(), "Current IP Information After Connection")  # Show IP info after connection attempt
+
     if connect_result.get('success'):
         # Check status after connection
         import time

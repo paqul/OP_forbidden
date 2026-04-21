@@ -14,7 +14,8 @@ available_functions = {
     "get_vpn_server_status": tools.get_vpn_server_status,
     "connect_to_vpn": tools.connect_to_vpn,
     "disconnect_vpn": tools.disconnect_vpn,
-    "get_current_connection_info": tools.get_current_connection_info
+    "get_current_connection_info": tools.get_current_connection_info,
+    "test_vpn_connection": tools.test_vpn_connection
 }
 
 def run():

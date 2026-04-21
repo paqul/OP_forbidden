@@ -57,7 +57,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "connect_to_vpn",
-            "description": "Connect to a Mullvad VPN server using WireGuard. Creates configuration file and activates tunnel. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). Returns JSON with connection status and details. Requires WireGuard installed.",
+            "description": "Connect to a Mullvad VPN server using WireGuard. Creates configuration file and activates tunnel. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). Returns JSON with connection status and details. Requires WireGuard installed. WARNING: Without mullvad_account, internet will NOT work (tunnel routes all traffic but can't authenticate). Use test_mode=true to test connection without losing internet.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -72,7 +72,11 @@ tools = [
                     },
                     "mullvad_account": {
                         "type": "string",
-                        "description": "Optional Mullvad account number for authenticated connection"
+                        "description": "Mullvad account number (16 digits) for authenticated connection. REQUIRED for internet to work!"
+                    },
+                    "test_mode": {
+                        "type": "boolean",
+                        "description": "Test mode - creates tunnel without routing all traffic (prevents internet loss). Use this to test connection without a Mullvad account."
                     }
                 },
                 "required": ["server_id"]
@@ -101,6 +105,18 @@ tools = [
         "function": {
             "name": "get_current_connection_info",
             "description": "Get real current public IP location using ProtonVPN API. Returns JSON with your actual IP address, country, ISP, and geographic coordinates. Useful to verify if VPN would change your location.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "test_vpn_connection",
+            "description": "Test if the current VPN connection has working internet access. Returns JSON with connection test results. Use after connecting to verify the tunnel works properly.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -138,7 +154,55 @@ def _generate_wireguard_keypair() -> tuple:
         raise Exception(f"Failed to generate keypair: {str(e)}")
 
 
-def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account: str = None) -> str:
+def _register_key_with_mullvad(account_number: str, public_key: str) -> Dict:
+    """Register WireGuard public key with Mullvad and get assigned IP addresses."""
+    try:
+        # Mullvad WireGuard API endpoint
+        url = f"https://api.mullvad.net/wg/"
+        
+        # Send public key registration request
+        response = requests.post(
+            url,
+            json={"account": account_number, "pubkey": public_key},
+            timeout=10
+        )
+        
+        if response.status_code == 200:
+            data = response.json()
+            return {
+                "success": True,
+                "ipv4_address": data.get('ipv4_address'),
+                "ipv6_address": data.get('ipv6_address'),
+                "pubkey": public_key
+            }
+        elif response.status_code == 401:
+            return {
+                "success": False,
+                "error": "Invalid Mullvad account number"
+            }
+        elif response.status_code == 403:
+            return {
+                "success": False,
+                "error": "Account has no credit. Please add time at mullvad.net"
+            }
+        else:
+            return {
+                "success": False,
+                "error": f"Mullvad API error: {response.status_code} - {response.text}"
+            }
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "error": f"Failed to contact Mullvad API: {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Key registration failed: {str(e)}"
+        }
+
+
+def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account: str = None, test_mode: bool = False, assigned_ipv4: str = None, assigned_ipv6: str = None) -> str:
     """Create WireGuard configuration file for a Mullvad server."""
     try:
         # Generate keypair for this connection
@@ -148,24 +212,49 @@ def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account:
         server_ip = server_data['ipv4_addr_in']
         server_pubkey = server_data['pubkey']
         
-        # Note: For actual Mullvad connection, you need an account number
-        # This creates a valid WireGuard config structure
+        # If we have a Mullvad account, register the key and get assigned IPs
+        if mullvad_account and not test_mode:
+            registration = _register_key_with_mullvad(mullvad_account, public_key)
+            
+            if not registration.get('success'):
+                raise Exception(f"Mullvad key registration failed: {registration.get('error')}")
+            
+            assigned_ipv4 = registration.get('ipv4_address')
+            assigned_ipv6 = registration.get('ipv6_address')
+        
+        # Use assigned IPs if available, otherwise use generic IP
+        if assigned_ipv4:
+            interface_addresses = f"{assigned_ipv4}/32"
+            if assigned_ipv6:
+                interface_addresses += f", {assigned_ipv6}/128"
+        else:
+            interface_addresses = "10.64.0.2/32"
+        
+        # In test mode, don't route all traffic (prevents internet loss)
+        # In production mode, route all traffic through VPN
+        if test_mode:
+            allowed_ips = "10.64.0.0/10"
+        else:
+            allowed_ips = "0.0.0.0/0, ::/0"
+        
+        # Create WireGuard configuration
         config_content = f"""[Interface]
 # WireGuard Configuration for {server_id}
 PrivateKey = {private_key}
-Address = 10.64.0.2/32
+Address = {interface_addresses}
 DNS = 193.138.218.74
 
 [Peer]
 PublicKey = {server_pubkey}
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = {allowed_ips}
 Endpoint = {server_ip}:51820
 """
         
         if mullvad_account:
+            account_comment = f"# Mullvad Account: {mullvad_account[:4]}****{mullvad_account[-4:]}\n"
             config_content = config_content.replace(
-                f"PrivateKey = {private_key}",
-                f"# Mullvad Account: {mullvad_account}\nPrivateKey = {private_key}"
+                f"# WireGuard Configuration for {server_id}",
+                f"# WireGuard Configuration for {server_id}\n{account_comment}# Authenticated with Mullvad API"
             )
         
         # Save config file
@@ -204,28 +293,30 @@ def _run_wireguard_cmd(args: List[str]) -> tuple:
 def get_wireguard_status() -> Dict:
     """Get current WireGuard connection status."""
     try:
-        # Try to get tunnel status using wireguard.exe /tunnelstatus
-        code, stdout, stderr = _run_wireguard_cmd([WG_GUI_PATH, "/tunnelstatus"])
+        # Check for running WireGuard services
+        result = subprocess.run(
+            ["powershell", "-Command", 
+             "Get-Service | Where-Object { $_.Name -like 'WireGuardTunnel$*' -and $_.Status -eq 'Running' } | Select-Object -ExpandProperty Name"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
         
-        if code != 0:
+        if result.returncode != 0 or not result.stdout.strip():
             return {
                 "connected": False,
                 "tunnel_name": None,
                 "status": "disconnected"
             }
         
-        # Parse output to get active tunnel
-        lines = stdout.strip().split('\n')
-        active_tunnel = None
-        for line in lines:
-            if line.strip():
-                active_tunnel = line.strip()
-                break
-        
-        if active_tunnel:
+        # Parse service name to get tunnel name
+        # Service name format: WireGuardTunnel$<tunnel_name>
+        service_name = result.stdout.strip().split('\n')[0]
+        if service_name.startswith("WireGuardTunnel$"):
+            tunnel_name = service_name.replace("WireGuardTunnel$", "")
             return {
                 "connected": True,
-                "tunnel_name": active_tunnel,
+                "tunnel_name": tunnel_name,
                 "status": "connected"
             }
         else:
@@ -332,13 +423,19 @@ def get_vpn_server_status(server_id: str) -> Dict:
         }
 
 
-def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account: str = None) -> Dict:
+def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account: str = None, test_mode: bool = False) -> Dict:
     """
     Connect to a Mullvad VPN server using WireGuard.
     Creates configuration file and activates tunnel.
     
-    Note: For full Mullvad functionality, you need a Mullvad account number.
-    Without it, the config is created but may not authenticate.
+    WARNING: Without mullvad_account, ALL INTERNET TRAFFIC will be routed through 
+    an unauthenticated tunnel and WILL NOT WORK! You will lose internet access.
+    
+    Args:
+        server_id: Server hostname from list_vpn_servers
+        protocol: VPN protocol (wireguard recommended)
+        mullvad_account: Your Mullvad account number (16 digits) - REQUIRED for internet!
+        test_mode: If True, doesn't route all traffic (safe testing without account)
     
     REQUIRES: Administrator privileges on Windows
     """
@@ -349,6 +446,15 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
                 "success": False,
                 "error": "Administrator privileges required. Please run Python as Administrator.",
                 "help": "Right-click Python/IDE and select 'Run as Administrator'"
+            }
+        
+        # Warn about internet loss if no account provided
+        if not mullvad_account and not test_mode:
+            return {
+                "success": False,
+                "error": "INTERNET WILL BE LOST: Connecting without mullvad_account will route all traffic through unauthenticated tunnel!",
+                "help": "Either provide 'mullvad_account' parameter OR use 'test_mode=True' to test safely",
+                "mullvad_signup": "Get account at https://mullvad.net/en/account/create"
             }
         
         # Check if already connected
@@ -370,8 +476,17 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
                 "error": f"Server '{server_id}' not found. Use list_vpn_servers to find valid servers."
             }
         
-        # Create WireGuard configuration
-        config_path = _create_wireguard_config(server_id, server, mullvad_account)
+        # Create WireGuard configuration (with Mullvad API registration if account provided)
+        try:
+            config_path = _create_wireguard_config(server_id, server, mullvad_account, test_mode)
+            registration_success = True
+            registration_msg = "✅ Registered with Mullvad API" if mullvad_account and not test_mode else None
+        except Exception as config_error:
+            return {
+                "success": False,
+                "error": f"Configuration failed: {str(config_error)}",
+                "help": "Check your Mullvad account number and internet connection"
+            }
         
         # Activate tunnel using WireGuard GUI
         code, stdout, stderr = _run_wireguard_cmd([
@@ -387,13 +502,32 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
                 "help": "Ensure WireGuard is installed and you have admin rights"
             }
         
-        # Start the tunnel
+        # Start the tunnel using Windows Service
         tunnel_name = server_id
-        code, stdout, stderr = _run_wireguard_cmd([
-            WG_GUI_PATH,
-            "/start",
-            tunnel_name
-        ])
+        service_name = f"WireGuardTunnel${tunnel_name}"
+        
+        # Start the service
+        result = subprocess.run(
+            ["powershell", "-Command", f"Start-Service -Name '{service_name}'"],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+        code = result.returncode
+        
+        # Determine connection mode and warnings
+        if test_mode:
+            mode_msg = "TEST MODE: Tunnel created without routing all traffic. Internet should still work."
+            auth_msg = None
+            warning = None
+        elif mullvad_account:
+            mode_msg = "PRODUCTION MODE: Authenticated with Mullvad. All traffic routed through VPN with working internet!"
+            auth_msg = "✅ WireGuard key registered with Mullvad API - Internet will work!"
+            warning = None
+        else:
+            mode_msg = "ERROR: This should not happen - mullvad_account check failed!"
+            auth_msg = None
+            warning = "CRITICAL: All traffic is routed through unauthenticated tunnel!"
         
         connection_info = {
             "server_id": server_id,
@@ -404,7 +538,11 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
             "config_path": config_path,
             "provider": server.get('provider', 'Unknown'),
             "tunnel_name": tunnel_name,
-            "note": "Config created. For full Mullvad access, add your account number." if not mullvad_account else "Connected with Mullvad account."
+            "test_mode": test_mode,
+            "authenticated": mullvad_account is not None and not test_mode,
+            "mode": mode_msg,
+            "authentication": auth_msg,
+            "warning": warning
         }
         
         return {
@@ -446,13 +584,16 @@ def disconnect_vpn(force: bool = False) -> Dict:
             }
         
         tunnel_name = status.get('tunnel_name')
+        service_name = f"WireGuardTunnel${tunnel_name}"
         
-        # Stop the tunnel
-        code, stdout, stderr = _run_wireguard_cmd([
-            WG_GUI_PATH,
-            "/stop",
-            tunnel_name
-        ])
+        # Stop the tunnel using Windows Service
+        result = subprocess.run(
+            ["powershell", "-Command", f"Stop-Service -Name '{service_name}' -Force"],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        code = result.returncode
         
         disconnect_info = {
             "tunnel_name": tunnel_name,
@@ -575,5 +716,51 @@ def check_wireguard_installation() -> Dict:
         return {
             "success": False,
             "error": str(e)
+        }
+
+
+def test_vpn_connection() -> Dict:
+    """
+    Test if VPN connection is working by checking internet access.
+    Use this after connecting to verify the tunnel has internet access.
+    """
+    try:
+        # First check if a tunnel is running
+        status = get_wireguard_status()
+        
+        if not status.get('connected'):
+            return {
+                "success": False,
+                "error": "No active VPN connection to test",
+                "help": "Connect to a VPN first using connect_to_vpn()"
+            }
+        
+        # Try to access internet through the tunnel
+        try:
+            response = requests.get('https://api.protonvpn.ch/vpn/location', timeout=5)
+            location_data = response.json()
+            
+            return {
+                "success": True,
+                "internet_working": True,
+                "tunnel_name": status.get('tunnel_name'),
+                "current_ip": location_data.get('IP'),
+                "country": location_data.get('Country'),
+                "isp": location_data.get('ISP'),
+                "message": "VPN tunnel has working internet access!"
+            }
+        except requests.exceptions.RequestException as e:
+            return {
+                "success": False,
+                "internet_working": False,
+                "tunnel_name": status.get('tunnel_name'),
+                "error": "VPN tunnel is active but has NO INTERNET ACCESS",
+                "reason": str(e),
+                "help": "This happens without a valid Mullvad account. Disconnect with disconnect_vpn() to restore internet."
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Test failed: {str(e)}"
         }
 
