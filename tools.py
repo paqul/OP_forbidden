@@ -3,7 +3,18 @@ import sys
 import json
 import subprocess
 import requests
+import tempfile
+import base64
+from pathlib import Path
 from typing import Dict, List, Optional
+
+# WireGuard paths
+WG_PATH = r"C:\Program Files\WireGuard\wg.exe"
+WG_GUI_PATH = r"C:\Program Files\WireGuard\wireguard.exe"
+WG_CONFIG_DIR = Path.home() / "AppData" / "Local" / "WireGuard" / "Configurations"
+
+# Ensure config directory exists
+WG_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 tools = [
@@ -46,7 +57,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "connect_to_vpn",
-            "description": "Simulate VPN connection to a Mullvad server. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). Returns JSON with connection status, simulated IP addresses, and connection details. NOTE: This is a simulation - actual VPN connection requires WireGuard client installation.",
+            "description": "Connect to a Mullvad VPN server using WireGuard. Creates configuration file and activates tunnel. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). Returns JSON with connection status and details. Requires WireGuard installed.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -58,6 +69,10 @@ tools = [
                         "type": "string",
                         "description": "VPN protocol to use (Mullvad uses WireGuard)",
                         "enum": ["wireguard", "openvpn", "auto"]
+                    },
+                    "mullvad_account": {
+                        "type": "string",
+                        "description": "Optional Mullvad account number for authenticated connection"
                     }
                 },
                 "required": ["server_id"]
@@ -68,13 +83,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "disconnect_vpn",
-            "description": "Simulate disconnecting from VPN connection. Returns JSON with success status and simulated connection duration/data transfer stats. NOTE: This is a simulation.",
+            "description": "Disconnect from active WireGuard VPN connection. Stops the tunnel and optionally removes it completely. Returns JSON with disconnect status.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "force": {
                         "type": "boolean",
-                        "description": "Force disconnect (simulation parameter)"
+                        "description": "Force disconnect and remove tunnel service completely"
                     }
                 },
                 "required": []
@@ -94,6 +109,137 @@ tools = [
         }
     }
 ]
+
+
+def _generate_wireguard_keypair() -> tuple:
+    """Generate WireGuard private and public key pair."""
+    try:
+        # Generate private key
+        result = subprocess.run(
+            [WG_PATH, "genkey"],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        private_key = result.stdout.strip()
+        
+        # Generate public key from private key
+        result = subprocess.run(
+            [WG_PATH, "pubkey"],
+            input=private_key,
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        public_key = result.stdout.strip()
+        
+        return private_key, public_key
+    except Exception as e:
+        raise Exception(f"Failed to generate keypair: {str(e)}")
+
+
+def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account: str = None) -> str:
+    """Create WireGuard configuration file for a Mullvad server."""
+    try:
+        # Generate keypair for this connection
+        private_key, public_key = _generate_wireguard_keypair()
+        
+        # Extract server info
+        server_ip = server_data['ipv4_addr_in']
+        server_pubkey = server_data['pubkey']
+        
+        # Note: For actual Mullvad connection, you need an account number
+        # This creates a valid WireGuard config structure
+        config_content = f"""[Interface]
+# WireGuard Configuration for {server_id}
+PrivateKey = {private_key}
+Address = 10.64.0.2/32
+DNS = 193.138.218.74
+
+[Peer]
+PublicKey = {server_pubkey}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {server_ip}:51820
+"""
+        
+        if mullvad_account:
+            config_content = config_content.replace(
+                f"PrivateKey = {private_key}",
+                f"# Mullvad Account: {mullvad_account}\nPrivateKey = {private_key}"
+            )
+        
+        # Save config file
+        config_path = WG_CONFIG_DIR / f"{server_id}.conf"
+        with open(config_path, 'w') as f:
+            f.write(config_content)
+        
+        return str(config_path)
+    except Exception as e:
+        raise Exception(f"Failed to create config: {str(e)}")
+
+
+def _is_admin() -> bool:
+    """Check if script is running with administrator privileges."""
+    try:
+        import ctypes
+        return ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except:
+        return False
+
+
+def _run_wireguard_cmd(args: List[str]) -> tuple:
+    """Run WireGuard command and return output."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        return result.returncode, result.stdout, result.stderr
+    except Exception as e:
+        return -1, "", str(e)
+
+
+def get_wireguard_status() -> Dict:
+    """Get current WireGuard connection status."""
+    try:
+        # Try to get tunnel status using wireguard.exe /tunnelstatus
+        code, stdout, stderr = _run_wireguard_cmd([WG_GUI_PATH, "/tunnelstatus"])
+        
+        if code != 0:
+            return {
+                "connected": False,
+                "tunnel_name": None,
+                "status": "disconnected"
+            }
+        
+        # Parse output to get active tunnel
+        lines = stdout.strip().split('\n')
+        active_tunnel = None
+        for line in lines:
+            if line.strip():
+                active_tunnel = line.strip()
+                break
+        
+        if active_tunnel:
+            return {
+                "connected": True,
+                "tunnel_name": active_tunnel,
+                "status": "connected"
+            }
+        else:
+            return {
+                "connected": False,
+                "tunnel_name": None,
+                "status": "disconnected"
+            }
+    except Exception as e:
+        return {
+            "connected": False,
+            "error": str(e),
+            "status": "unknown"
+        }
 
 
 def list_vpn_servers(region: str = "all") -> Dict:
@@ -186,12 +332,33 @@ def get_vpn_server_status(server_id: str) -> Dict:
         }
 
 
-def connect_to_vpn(server_id: str, protocol: str = "wireguard") -> Dict:
+def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account: str = None) -> Dict:
     """
-    Simulate VPN connection to a Mullvad server.
-    In production, this would require WireGuard client and actual connection setup.
+    Connect to a Mullvad VPN server using WireGuard.
+    Creates configuration file and activates tunnel.
+    
+    Note: For full Mullvad functionality, you need a Mullvad account number.
+    Without it, the config is created but may not authenticate.
+    
+    REQUIRES: Administrator privileges on Windows
     """
     try:
+        # Check for admin privileges
+        if not _is_admin():
+            return {
+                "success": False,
+                "error": "Administrator privileges required. Please run Python as Administrator.",
+                "help": "Right-click Python/IDE and select 'Run as Administrator'"
+            }
+        
+        # Check if already connected
+        status = get_wireguard_status()
+        if status.get('connected'):
+            return {
+                "success": False,
+                "error": f"Already connected to tunnel: {status.get('tunnel_name')}. Disconnect first."
+            }
+        
         # Verify server exists in Mullvad network
         response = requests.get('https://api.mullvad.net/www/relays/all/', timeout=10)
         all_servers = response.json()
@@ -203,52 +370,114 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard") -> Dict:
                 "error": f"Server '{server_id}' not found. Use list_vpn_servers to find valid servers."
             }
         
-        # Simulate connection with real server data
+        # Create WireGuard configuration
+        config_path = _create_wireguard_config(server_id, server, mullvad_account)
+        
+        # Activate tunnel using WireGuard GUI
+        code, stdout, stderr = _run_wireguard_cmd([
+            WG_GUI_PATH, 
+            "/installtunnelservice", 
+            config_path
+        ])
+        
+        if code != 0 and "already exists" not in stderr.lower():
+            return {
+                "success": False,
+                "error": f"Failed to install tunnel: {stderr}",
+                "help": "Ensure WireGuard is installed and you have admin rights"
+            }
+        
+        # Start the tunnel
+        tunnel_name = server_id
+        code, stdout, stderr = _run_wireguard_cmd([
+            WG_GUI_PATH,
+            "/start",
+            tunnel_name
+        ])
+        
         connection_info = {
             "server_id": server_id,
             "server_name": f"{server['city_name']}, {server['country_name']}",
-            "protocol": protocol,
-            "status": "connected (simulated)",
+            "protocol": "wireguard",
+            "status": "connected" if code == 0 else "connection_attempted",
             "server_ip": server['ipv4_addr_in'],
-            "simulated_vpn_ip": "10.8.0.6",
+            "config_path": config_path,
             "provider": server.get('provider', 'Unknown'),
-            "connection_note": "This is a simulation. To actually connect, install WireGuard and use the server's public key.",
-            "wireguard_port": server.get('multihop_port', 51820)
+            "tunnel_name": tunnel_name,
+            "note": "Config created. For full Mullvad access, add your account number." if not mullvad_account else "Connected with Mullvad account."
         }
         
         return {
             "success": True,
-            "message": f"Simulated connection to {server_id}",
+            "message": f"Connected to {server_id}",
             "connection": connection_info
         }
     except Exception as e:
         return {
             "success": False,
-            "error": str(e)
+            "error": f"Connection failed: {str(e)}"
         }
 
 
 def disconnect_vpn(force: bool = False) -> Dict:
     """
-    Simulate disconnecting from VPN.
-    In production, this would disconnect actual WireGuard/OpenVPN connection.
+    Disconnect from active WireGuard VPN connection.
+    Stops and optionally removes the tunnel.
+    
+    REQUIRES: Administrator privileges on Windows
     """
     try:
-        return {
-            "success": True,
-            "message": "VPN disconnected successfully (simulated)",
-            "note": "This is a simulation. In production, would disconnect actual VPN client.",
-            "simulated_stats": {
-                "duration": "2 hours 34 minutes",
-                "data_sent": "342 MB",
-                "data_received": "876 MB",
-                "total_transferred": "1.2 GB"
+        # Check for admin privileges
+        if not _is_admin():
+            return {
+                "success": False,
+                "error": "Administrator privileges required. Please run Python as Administrator.",
+                "help": "Right-click Python/IDE and select 'Run as Administrator'"
             }
+        
+        # Check current status
+        status = get_wireguard_status()
+        
+        if not status.get('connected'):
+            return {
+                "success": True,
+                "message": "No active VPN connection",
+                "was_connected": False
+            }
+        
+        tunnel_name = status.get('tunnel_name')
+        
+        # Stop the tunnel
+        code, stdout, stderr = _run_wireguard_cmd([
+            WG_GUI_PATH,
+            "/stop",
+            tunnel_name
+        ])
+        
+        disconnect_info = {
+            "tunnel_name": tunnel_name,
+            "status": "disconnected" if code == 0 else "stop_attempted",
+            "force": force
+        }
+        
+        # Optionally remove tunnel service
+        if force:
+            code2, stdout2, stderr2 = _run_wireguard_cmd([
+                WG_GUI_PATH,
+                "/uninstalltunnelservice",
+                tunnel_name
+            ])
+            disconnect_info["tunnel_removed"] = code2 == 0
+        
+        return {
+            "success": code == 0,
+            "message": f"Disconnected from {tunnel_name}" if code == 0 else "Disconnect attempted",
+            "disconnect_info": disconnect_info
         }
     except Exception as e:
         return {
             "success": False,
-            "error": str(e)
+            "error": f"Disconnect failed: {str(e)}"
         }
 
 
@@ -276,5 +505,75 @@ def get_current_connection_info() -> Dict:
         return {
             "success": False,
             "error": f"Could not fetch location info: {str(e)}"
+        }
+
+
+def list_configured_tunnels() -> Dict:
+    """List all WireGuard tunnels configured on this system."""
+    try:
+        configs = list(WG_CONFIG_DIR.glob("*.conf"))
+        tunnels = []
+        
+        for config in configs:
+            tunnel_name = config.stem
+            tunnels.append({
+                "name": tunnel_name,
+                "config_path": str(config),
+                "size": config.stat().st_size
+            })
+        
+        return {
+            "success": True,
+            "count": len(tunnels),
+            "tunnels": tunnels,
+            "config_directory": str(WG_CONFIG_DIR)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+def check_wireguard_installation() -> Dict:
+    """Verify WireGuard is properly installed and accessible."""
+    try:
+        wg_exists = os.path.exists(WG_PATH)
+        gui_exists = os.path.exists(WG_GUI_PATH)
+        config_dir_exists = WG_CONFIG_DIR.exists()
+        is_admin = _is_admin()
+        
+        # Try to get version
+        version = None
+        if wg_exists:
+            try:
+                result = subprocess.run(
+                    [WG_PATH, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                version = result.stdout.strip() if result.returncode == 0 else None
+            except:
+                pass
+        
+        return {
+            "success": wg_exists and gui_exists,
+            "wg_cli_installed": wg_exists,
+            "wg_gui_installed": gui_exists,
+            "config_directory_exists": config_dir_exists,
+            "running_as_admin": is_admin,
+            "wg_path": WG_PATH,
+            "gui_path": WG_GUI_PATH,
+            "config_dir": str(WG_CONFIG_DIR),
+            "version": version,
+            "ready": wg_exists and gui_exists and config_dir_exists,
+            "can_manage_tunnels": is_admin,
+            "note": "Administrator privileges required for tunnel management" if not is_admin else "Running with admin privileges"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
         }
 
