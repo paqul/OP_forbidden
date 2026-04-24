@@ -5,6 +5,7 @@ import subprocess
 import requests
 import tempfile
 import base64
+import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -12,6 +13,7 @@ from typing import Dict, List, Optional
 WG_PATH = r"C:\Program Files\WireGuard\wg.exe"
 WG_GUI_PATH = r"C:\Program Files\WireGuard\wireguard.exe"
 WG_CONFIG_DIR = Path.home() / "AppData" / "Local" / "WireGuard" / "Configurations"
+WG_KEYS_STORAGE = Path.home() / "AppData" / "Local" / "WireGuard" / "mullvad_keys.json"
 
 # Ensure config directory exists
 WG_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,7 +59,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "connect_to_vpn",
-            "description": "Connect to a Mullvad VPN server using WireGuard. Creates configuration file and activates tunnel. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). Returns JSON with connection status and details. Requires WireGuard installed. WARNING: Without mullvad_account, internet will NOT work (tunnel routes all traffic but can't authenticate). Use test_mode=true to test connection without losing internet.",
+            "description": "Connect to a Mullvad VPN server using WireGuard with authenticated access. Creates configuration file and activates tunnel. Use server_id from list_vpn_servers (e.g., 'us-nyc-wg-801'). ALWAYS provide mullvad_account parameter for production connection with working internet. Returns JSON with connection status and details. Requires WireGuard installed and admin privileges.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -65,21 +67,21 @@ tools = [
                         "type": "string",
                         "description": "The hostname from list_vpn_servers (e.g., 'us-nyc-wg-801', 'se-got-wg-001')"
                     },
-                    "protocol": {
-                        "type": "string",
-                        "description": "VPN protocol to use (Mullvad uses WireGuard)",
-                        "enum": ["wireguard", "openvpn", "auto"]
-                    },
                     "mullvad_account": {
                         "type": "string",
-                        "description": "Mullvad account number (16 digits) for authenticated connection. REQUIRED for internet to work!"
+                        "description": "Mullvad account number (16 digits) for authenticated connection. ALWAYS provide this for production VPN connection with working internet!"
+                    },
+                    "protocol": {
+                        "type": "string",
+                        "description": "VPN protocol to use (default: wireguard)",
+                        "enum": ["wireguard", "openvpn", "auto"]
                     },
                     "test_mode": {
                         "type": "boolean",
-                        "description": "Test mode - creates tunnel without routing all traffic (prevents internet loss). Use this to test connection without a Mullvad account."
+                        "description": "DO NOT USE - For testing only. Always use false (default) for production connections."
                     }
                 },
-                "required": ["server_id"]
+                "required": ["server_id", "mullvad_account"]
             }
         }
     },
@@ -125,6 +127,56 @@ tools = [
         }
     }
 ]
+
+
+def _load_stored_keys() -> Dict:
+    """Load stored WireGuard keypairs from file."""
+    try:
+        if WG_KEYS_STORAGE.exists():
+            with open(WG_KEYS_STORAGE, 'r') as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        print(f"Warning: Could not load stored keys: {str(e)}")
+        return {}
+
+
+def _save_stored_keys(keys_data: Dict):
+    """Save WireGuard keypairs to file."""
+    try:
+        with open(WG_KEYS_STORAGE, 'w') as f:
+            json.dump(keys_data, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save keys: {str(e)}")
+
+
+def _get_or_create_keypair(account_number: str) -> tuple:
+    """Get existing keypair for account or create new one if needed."""
+    stored_keys = _load_stored_keys()
+    
+    # Check if we have a key for this account
+    if account_number in stored_keys:
+        key_data = stored_keys[account_number]
+        private_key = key_data.get('private_key')
+        public_key = key_data.get('public_key')
+        
+        if private_key and public_key:
+            print(f"✅ Reusing existing WireGuard key for account {account_number[:4]}****{account_number[-4:]}")
+            return private_key, public_key
+    
+    # Generate new keypair if none exists
+    print(f"🔑 Generating new WireGuard keypair for account {account_number[:4]}****{account_number[-4:]}")
+    private_key, public_key = _generate_wireguard_keypair()
+    
+    # Store the keypair
+    stored_keys[account_number] = {
+        'private_key': private_key,
+        'public_key': public_key,
+        'created_at': time.strftime('%Y-%m-%d %H:%M:%S')
+    }
+    _save_stored_keys(stored_keys)
+    
+    return private_key, public_key
 
 
 def _generate_wireguard_keypair() -> tuple:
@@ -216,8 +268,13 @@ def _register_key_with_mullvad(account_number: str, public_key: str) -> Dict:
 def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account: str = None, test_mode: bool = False, assigned_ipv4: str = None, assigned_ipv6: str = None) -> str:
     """Create WireGuard configuration file for a Mullvad server."""
     try:
-        # Generate keypair for this connection
-        private_key, public_key = _generate_wireguard_keypair()
+        # Get or create keypair for this connection
+        # If using Mullvad account, reuse existing key to avoid hitting 5-key limit
+        if mullvad_account and not test_mode:
+            private_key, public_key = _get_or_create_keypair(mullvad_account)
+        else:
+            # For test mode, generate fresh keypair
+            private_key, public_key = _generate_wireguard_keypair()
         
         # Extract server info
         server_ip = server_data['ipv4_addr_in']
@@ -798,5 +855,95 @@ def test_vpn_connection() -> Dict:
         return {
             "success": False,
             "error": f"Test failed: {str(e)}"
+        }
+
+
+def get_stored_keys_info() -> Dict:
+    """
+    Get information about stored WireGuard keys.
+    Shows which accounts have keys stored and when they were created.
+    """
+    try:
+        stored_keys = _load_stored_keys()
+        
+        if not stored_keys:
+            return {
+                "success": True,
+                "message": "No stored keys found",
+                "keys_count": 0,
+                "storage_file": str(WG_KEYS_STORAGE)
+            }
+        
+        keys_info = []
+        for account, key_data in stored_keys.items():
+            keys_info.append({
+                "account": f"{account[:4]}****{account[-4:]}",
+                "public_key": key_data.get('public_key', 'N/A')[:20] + "...",
+                "created_at": key_data.get('created_at', 'Unknown')
+            })
+        
+        return {
+            "success": True,
+            "keys_count": len(stored_keys),
+            "keys": keys_info,
+            "storage_file": str(WG_KEYS_STORAGE),
+            "note": "These keys are reused to avoid hitting Mullvad's 5-key limit"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to get keys info: {str(e)}"
+        }
+
+
+def clear_stored_key(account_number: str) -> Dict:
+    """
+    Clear stored key for a specific Mullvad account.
+    Next connection will generate a new key.
+    """
+    try:
+        stored_keys = _load_stored_keys()
+        
+        if account_number not in stored_keys:
+            return {
+                "success": False,
+                "error": f"No stored key found for account {account_number[:4]}****{account_number[-4:]}"
+            }
+        
+        del stored_keys[account_number]
+        _save_stored_keys(stored_keys)
+        
+        return {
+            "success": True,
+            "message": f"Cleared stored key for account {account_number[:4]}****{account_number[-4:]}",
+            "remaining_keys": len(stored_keys)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to clear key: {str(e)}"
+        }
+
+
+def clear_all_stored_keys() -> Dict:
+    """
+    Clear all stored WireGuard keys.
+    Next connections will generate new keys.
+    """
+    try:
+        stored_keys = _load_stored_keys()
+        count = len(stored_keys)
+        
+        _save_stored_keys({})
+        
+        return {
+            "success": True,
+            "message": f"Cleared {count} stored key(s)",
+            "storage_file": str(WG_KEYS_STORAGE)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": f"Failed to clear keys: {str(e)}"
         }
 
