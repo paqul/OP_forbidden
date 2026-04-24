@@ -160,19 +160,30 @@ def _register_key_with_mullvad(account_number: str, public_key: str) -> Dict:
         # Mullvad WireGuard API endpoint
         url = f"https://api.mullvad.net/wg/"
         
-        # Send public key registration request
+        # Send public key registration request (using form data, not JSON)
         response = requests.post(
             url,
-            json={"account": account_number, "pubkey": public_key},
+            data={"account": account_number, "pubkey": public_key},
             timeout=10
         )
         
-        if response.status_code == 200:
-            data = response.json()
+        # Accept both 200 and 201 as success (201 = Created)
+        if response.status_code in [200, 201]:
+            # Try parsing as JSON first
+            try:
+                data = response.json()
+                ipv4 = data.get('ipv4_address')
+                ipv6 = data.get('ipv6_address')
+            except:
+                # If not JSON, parse plain text response: "10.71.4.226/32,fc00:bbbb:bbbb:bb01::8:4e1/128"
+                addresses = response.text.strip().split(',')
+                ipv4 = addresses[0] if len(addresses) > 0 else None
+                ipv6 = addresses[1] if len(addresses) > 1 else None
+            
             return {
                 "success": True,
-                "ipv4_address": data.get('ipv4_address'),
-                "ipv6_address": data.get('ipv6_address'),
+                "ipv4_address": ipv4,
+                "ipv6_address": ipv6,
                 "pubkey": public_key
             }
         elif response.status_code == 401:
@@ -224,9 +235,14 @@ def _create_wireguard_config(server_id: str, server_data: Dict, mullvad_account:
         
         # Use assigned IPs if available, otherwise use generic IP
         if assigned_ipv4:
-            interface_addresses = f"{assigned_ipv4}/32"
+            # Mullvad API returns IPs with CIDR notation already included (e.g., "10.72.193.60/32")
+            # So don't add /32 or /128 if it's already there
+            ipv4_addr = assigned_ipv4 if '/' in assigned_ipv4 else f"{assigned_ipv4}/32"
+            interface_addresses = ipv4_addr
+            
             if assigned_ipv6:
-                interface_addresses += f", {assigned_ipv6}/128"
+                ipv6_addr = assigned_ipv6 if '/' in assigned_ipv6 else f"{assigned_ipv6}/128"
+                interface_addresses += f", {ipv6_addr}"
         else:
             interface_addresses = "10.64.0.2/32"
         
@@ -508,12 +524,27 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
         
         # Start the service
         result = subprocess.run(
-            ["powershell", "-Command", f"Start-Service -Name '{service_name}'"],
+            ["powershell", "-Command", f"Start-Service -Name '{service_name}' -ErrorAction Stop"],
             capture_output=True,
             text=True,
             timeout=15
         )
         code = result.returncode
+        
+        # Check if service actually started
+        if code != 0:
+            error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+            return {
+                "success": False,
+                "error": f"Failed to start WireGuard service: {error_msg}",
+                "help": "Check Windows Event Viewer or run: Get-Service WireGuardTunnel$* | Format-List",
+                "debug": {
+                    "service_name": service_name,
+                    "exit_code": code,
+                    "stdout": result.stdout.strip(),
+                    "stderr": error_msg
+                }
+            }
         
         # Determine connection mode and warnings
         if test_mode:
@@ -529,11 +560,16 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
             auth_msg = None
             warning = "CRITICAL: All traffic is routed through unauthenticated tunnel!"
         
+        # Verify the service is actually running
+        import time
+        time.sleep(1)
+        verify_status = get_wireguard_status()
+        
         connection_info = {
             "server_id": server_id,
             "server_name": f"{server['city_name']}, {server['country_name']}",
             "protocol": "wireguard",
-            "status": "connected" if code == 0 else "connection_attempted",
+            "status": "connected" if verify_status.get('connected') else "started_but_not_connected",
             "server_ip": server['ipv4_addr_in'],
             "config_path": config_path,
             "provider": server.get('provider', 'Unknown'),
