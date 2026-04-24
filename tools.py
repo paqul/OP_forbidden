@@ -113,18 +113,6 @@ tools = [
                 "required": []
             }
         }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "test_vpn_connection",
-            "description": "Test if the current VPN connection has working internet access. Returns JSON with connection test results. Use after connecting to verify the tunnel works properly.",
-            "parameters": {
-                "type": "object",
-                "properties": {},
-                "required": []
-            }
-        }
     }
 ]
 

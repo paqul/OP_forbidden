@@ -245,6 +245,13 @@ def run(user_message: str = None):
                     
                     result = _execute_tool(tool_call, state)
                     if not result:
+                        # Tool execution failed, but we MUST provide a response for this tool_call_id
+                        messages.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": tool_call.function.name,
+                            "content": json.dumps({"success": False, "error": f"Tool {tool_call.function.name} execution failed"})
+                        })
                         continue
                     
                     # Add tool response to messages
