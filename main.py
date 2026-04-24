@@ -7,6 +7,7 @@ import vpn_tools
 import os
 import sys
 import llm_vpn_execution
+import llm_playwright_execution
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
     log_tool_call_result, log_final_response, log_error, log_session_summary)
 
@@ -34,12 +35,34 @@ agent_tools = [
                 "required": ["task_description"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "call_browser_agent",
+            "description": "Delegate browser automation and web scraping tasks to a specialized browser agent. Use this when the user asks to visit websites, scrape data, click elements, fill forms, take screenshots, or perform any browser automation. The agent has full Playwright automation capabilities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_description": {
+                        "type": "string",
+                        "description": "A clear description of the browser automation task to perform (e.g., 'Navigate to YouTube and take a screenshot of the homepage')"
+                    },
+                    "user_message": {
+                        "type": "string",
+                        "description": "The original user message/request for context"
+                    }
+                },
+                "required": ["task_description"]
+            }
+        }
     }
 ]
 
 # Available agent functions
 available_agents = {
-    "call_vpn_agent": lambda task_description, user_message=None: llm_vpn_execution.run(user_message or task_description)
+    "call_vpn_agent": lambda task_description, user_message=None: llm_vpn_execution.run(user_message or task_description),
+    "call_browser_agent": lambda task_description, user_message=None: llm_playwright_execution.run(user_message or task_description)
 }
 
 def main():
