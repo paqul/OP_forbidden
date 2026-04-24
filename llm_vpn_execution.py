@@ -155,7 +155,8 @@ def _execute_tool(tool_call, state):
 
 def _is_workflow_complete(state):
     """Check if VPN workflow is complete."""
-    return state['vpn_connected'] and state['vpn_disconnected']
+    # Return as soon as VPN connection is successful (don't wait for disconnection)
+    return state['vpn_connected']
 
 
 def _build_result(state, success, iterations, final_response=None, error=None):
@@ -192,10 +193,10 @@ def run(user_message: str = None):
     log_user_request(user_message)
     
     # Build system prompt with credentials
-    system_prompt = vpn_prompt + f"\n\nAVAILABLE CREDENTIALS:\n- Mullvad Account: {MULLVAD_ACCOUNT}\n\nALWAYS use this account when calling connect_to_vpn()."
+    system_vpn_prompt = vpn_prompt + f"\n\nAVAILABLE CREDENTIALS:\n- Mullvad Account: {MULLVAD_ACCOUNT}\n\nALWAYS use this account when calling connect_to_vpn()."
     
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": system_vpn_prompt},
         {"role": "user", "content": user_message}
     ]
     
@@ -228,8 +229,20 @@ def run(user_message: str = None):
             if tool_calls:
                 print(f"\nGPT calling {len(tool_calls)} tool(s)...\n")
                 tool_count = 0
+                workflow_completed = False
                 
                 for tool_call in tool_calls:
+                    # If workflow already completed, skip remaining tools but add dummy responses
+                    if workflow_completed:
+                        print(f"Skipping {tool_call.function.name} - workflow already complete")
+                        messages.append({
+                            "tool_call_id": tool_call.id,
+                            "role": "tool",
+                            "name": tool_call.function.name,
+                            "content": json.dumps({"skipped": True, "reason": "VPN already connected"})
+                        })
+                        continue
+                    
                     result = _execute_tool(tool_call, state)
                     if not result:
                         continue
@@ -250,13 +263,19 @@ def run(user_message: str = None):
                         })
                     
                     tool_count += 1
+                    
+                    # Check if workflow is complete after each tool
+                    # Set flag to skip remaining tools in this batch
+                    if _is_workflow_complete(state):
+                        workflow_completed = True
+                        print("✅ VPN connection established - skipping remaining tools in batch")
                 
                 print(f"\n✅ Completed {tool_count} tool(s)")
                 log_session_summary(total_requests=1, total_tools=tool_count)
                 
-                # Check if workflow is complete
-                if _is_workflow_complete(state):
-                    print("✅ VPN workflow complete!")
+                # Return immediately if workflow is complete
+                if workflow_completed:
+                    print("✅ VPN workflow complete - returning to orchestrator!")
                     return _build_result(state, True, iteration + 1)
                 
                 print("Continuing to next iteration...\n")
@@ -281,7 +300,8 @@ def run(user_message: str = None):
     print(f"   VPN Connected: {state['vpn_connected']}")
     print(f"   VPN Disconnected: {state['vpn_disconnected']}")
     
-    return _build_result(state, state['vpn_connected'] or state['vpn_disconnected'], max_iterations)
+    # Success if VPN was connected (even if not disconnected yet)
+    return _build_result(state, state['vpn_connected'], max_iterations)
 
 
 if __name__ == "__main__":
