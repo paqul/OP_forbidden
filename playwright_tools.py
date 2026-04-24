@@ -272,7 +272,7 @@ def _ensure_browser_running() -> tuple:
         return False, f"Browser connection lost: {str(e)}"
 
 
-def launch_browser(browser_type: str = "webkit", headless: bool = False, 
+def launch_browser(browser_type: str = "chromium", headless: bool = False, 
                    viewport_width: int = 1920, viewport_height: int = 1080) -> Dict:
     """
     Launch a browser instance with Playwright.
@@ -307,10 +307,23 @@ def launch_browser(browser_type: str = "webkit", headless: bool = False,
         # Launch browser
         _browser_instance = browser.launch(headless=headless)
         
-        # Create browser context with viewport
+        # User agent to appear as real browser (helps avoid bot detection)
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        
+        # Create browser context with viewport and NO STATE (fresh start - no cookies, no cache)
         _context_instance = _browser_instance.new_context(
-            viewport={"width": viewport_width, "height": viewport_height}
+            viewport={"width": viewport_width, "height": viewport_height},
+            user_agent=user_agent,
+            storage_state=None,  # No stored auth/cookies
+            ignore_https_errors=True,  # Ignore SSL errors
+            java_script_enabled=True,
+            accept_downloads=True,
+            locale="en-US",  # Set locale
+            timezone_id="Europe/Warsaw"  # Set timezone
         )
+        
+        # Clear all cookies and storage (double ensure clean state)
+        _context_instance.clear_cookies()
         
         # Create new page
         _page_instance = _context_instance.new_page()

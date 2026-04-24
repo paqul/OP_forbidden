@@ -17,7 +17,7 @@ def test_playwright_tools_direct():
     try:
         # Launch browser (visible window)
         print("1. Launching browser...")
-        result = playwright_tools.launch_browser(browser_type="webkit", headless=False)
+        result = playwright_tools.launch_browser(browser_type="chromium", headless=False)
         print(f"   ✅ Browser launched: {result['success']}")
         
         # Navigate to example.com
