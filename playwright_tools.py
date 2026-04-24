@@ -272,7 +272,7 @@ def _ensure_browser_running() -> tuple:
         return False, f"Browser connection lost: {str(e)}"
 
 
-def launch_browser(browser_type: str = "chromium", headless: bool = True, 
+def launch_browser(browser_type: str = "webkit", headless: bool = False, 
                    viewport_width: int = 1920, viewport_height: int = 1080) -> Dict:
     """
     Launch a browser instance with Playwright.

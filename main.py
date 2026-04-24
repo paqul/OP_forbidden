@@ -67,7 +67,9 @@ available_agents = {
 
 def main():
     print("Running Main Orchestrator LLM...\n")
-    user_message = "Ask another LLM to connect to a VPN server in Greece with authentication, check the connection status, and provide the current public IP and location."
+    user_message = "Ask another LLM to connect to a VPN server in Spain with authentication," \
+    "Then navigate to YouTube video https://www.youtube.com/watch?v=ULjo6JaFTWg, " \
+    "extract the video title and description, and take a screenshot of the page. Click button play and verify video is playing for 10 seconds, then disconnect VPN."
     log_user_request(user_message)
     
     messages = [
@@ -76,7 +78,7 @@ def main():
     ]
     
     model_name = "gpt-4o-mini"
-    max_iterations = 3
+    max_iterations = 10
     
     for iteration in range(max_iterations):
         print(f"\n{'='*60}")
