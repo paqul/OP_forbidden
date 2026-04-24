@@ -20,6 +20,10 @@ available_functions = {
     "get_page_info": playwright_tools.get_page_info,
     "close_browser": playwright_tools.close_browser,
     "execute_javascript": playwright_tools.execute_javascript,
+    "reset_timeout_counter": playwright_tools.reset_timeout_counter,
+    "wait_for_duration": playwright_tools.wait_for_duration,
+    "handle_consent_dialog": playwright_tools.handle_consent_dialog,
+    "check_for_bot_detection": playwright_tools.check_for_bot_detection,
 }
 
 # Configuration for tool guidance messages (data-driven approach)
@@ -53,6 +57,18 @@ TOOL_GUIDANCE = {
     },
     "execute_javascript": {
         "on_success": lambda r: f"✅ JavaScript executed. Result: {str(r.get('result', 'None'))[:100]}",
+    },
+    "reset_timeout_counter": {
+        "on_success": lambda r: f"✅ Timeout counter reset (was: {r.get('previous_count', 0)})",
+    },
+    "wait_for_duration": {
+        "on_success": lambda r: f"✅ Waited {r.get('elapsed_seconds', 0)} seconds ({r.get('checks_performed', 0)} checks performed)",
+    },
+    "handle_consent_dialog": {
+        "on_success": lambda r: f"✅ Consent dialog: {r.get('message', 'handled')}" if r.get('found', True) else f"ℹ️  No consent dialog found",
+    },
+    "check_for_bot_detection": {
+        "on_success": lambda r: f"✅ No bot detection found - page is accessible",
     }
 }
 
