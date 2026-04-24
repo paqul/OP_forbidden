@@ -3,7 +3,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools import get_stored_keys_info, clear_all_stored_keys
+from vpn_tools import get_stored_keys_info, clear_all_stored_keys
 import json
 
 # Check current stored keys

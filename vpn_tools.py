@@ -106,7 +106,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_current_connection_info",
-            "description": "Get real current public IP location using ProtonVPN API. Returns JSON with your actual IP address, country, ISP, and geographic coordinates. Useful to verify if VPN would change your location.",
+            "description": "Get current public IP, location, and VPN connection status. Returns your actual IP address, country, ISP, coordinates, AND if WireGuard VPN is connected (including which server). Use this to check if already connected to a specific server before reconnecting.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -706,22 +706,30 @@ def disconnect_vpn(force: bool = False) -> Dict:
 def get_current_connection_info() -> Dict:
     """
     Get REAL current public IP and location using ProtonVPN API.
+    Also includes WireGuard VPN connection status if connected.
     This shows your actual IP address and location (useful to verify VPN status).
     """
     try:
+        # Get WireGuard connection status first
+        wg_status = get_wireguard_status()
+        
         # Call ProtonVPN's free location API
         response = requests.get('https://api.protonvpn.ch/vpn/location', timeout=10)
         location_data = response.json()
         
-        return {
+        result = {
             "success": True,
             "current_ip": location_data.get('IP'),
             "country": location_data.get('Country'),
             "isp": location_data.get('ISP'),
             "latitude": location_data.get('Lat'),
             "longitude": location_data.get('Long'),
-            "note": "This is your REAL current IP. If connected to VPN, this would show VPN server's IP."
+            "vpn_connected": wg_status.get('connected', False),
+            "vpn_server": wg_status.get('tunnel_name') if wg_status.get('connected') else None,
+            "note": "This is your current public IP. VPN status shows if WireGuard tunnel is active."
         }
+        
+        return result
         
     except Exception as e:
         return {
@@ -934,4 +942,3 @@ def clear_all_stored_keys() -> Dict:
             "success": False,
             "error": f"Failed to clear keys: {str(e)}"
         }
-

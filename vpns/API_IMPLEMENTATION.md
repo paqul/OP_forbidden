@@ -93,7 +93,7 @@ python tests\test_real_mullvad.py
 ### Full VPN with Working Internet
 
 ```python
-from tools import connect_to_vpn, disconnect_vpn
+from vpn_tools import connect_to_vpn, disconnect_vpn
 from vpns.vpn_config import MULLVAD_ACCOUNT
 
 # Connect (registers key with Mullvad, internet works!)
@@ -219,7 +219,7 @@ Endpoint = 193.32.126.66:51820
 
 4. **Test connection**:
    ```python
-   from tools import test_vpn_connection
+   from vpn_tools import test_vpn_connection
    test = test_vpn_connection()
    print(test)
    ```

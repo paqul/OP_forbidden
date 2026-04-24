@@ -155,7 +155,7 @@ It requires:
 Start-Service -Name "WireGuardTunnel$mullvad-us-nyc-001"
 
 # Check status with our tool
-python -c "from tools import get_wireguard_status; print(get_wireguard_status())"
+python -c "from vpn_tools import get_wireguard_status; print(get_wireguard_status())"
 
 # Test internet
 python -c "from tools import test_vpn_connection; print(test_vpn_connection())"

@@ -23,7 +23,7 @@ Your Browser → WireGuard Tunnel → Mullvad Server (401 Unauthorized) → ❌ 
 Test mode creates a tunnel **without routing all your traffic**, so internet keeps working:
 
 ```python
-from tools import connect_to_vpn, test_vpn_connection, disconnect_vpn
+from vpn_tools import connect_to_vpn, test_vpn_connection, disconnect_vpn
 
 # Safe connection - internet stays working!
 result = connect_to_vpn("fr-par-wg-001", test_mode=True)
@@ -88,7 +88,7 @@ connect_to_vpn("server-id", mullvad_account="...")  # ✅ With account
 Check if VPN has internet access:
 
 ```python
-from tools import test_vpn_connection
+from vpn_tools import test_vpn_connection
 
 test = test_vpn_connection()
 
@@ -126,7 +126,7 @@ All responses now include mode information:
 ## Example: Safe Testing Workflow
 
 ```python
-from tools import *
+from vpn_tools import *
 
 # 1. Find servers
 servers = list_vpn_servers(region="eu-west")

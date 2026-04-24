@@ -3,37 +3,37 @@ from prompts.system_prompts import vpn_prompt
 from openai import OpenAI
 import json
 import time
-import tools
+import vpn_tools
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
     log_tool_call_result, log_final_response, log_error, log_session_summary)
 
 llm_vpn_client = OpenAI(api_key=open_ai_api_key)
 
 available_functions = {
-    "list_vpn_servers": tools.list_vpn_servers,
-    "get_vpn_server_status": tools.get_vpn_server_status,
-    "connect_to_vpn": tools.connect_to_vpn,
-    "disconnect_vpn": tools.disconnect_vpn,
-    "get_current_connection_info": tools.get_current_connection_info,
+    "list_vpn_servers": vpn_tools.list_vpn_servers,
+    "get_vpn_server_status": vpn_tools.get_vpn_server_status,
+    "connect_to_vpn": vpn_tools.connect_to_vpn,
+    "disconnect_vpn": vpn_tools.disconnect_vpn,
+    "get_current_connection_info": vpn_tools.get_current_connection_info,
 }
 
 # Configuration for tool guidance messages (data-driven approach)
 TOOL_GUIDANCE = {
     "list_vpn_servers": {
-        "on_success": lambda r: f"✅ Retrieved {r.get('count', 0)} VPN servers. First: {r['servers'][0]['server_id'] if r.get('servers') else 'N/A'}. Next: get_vpn_server_status",
+        "on_success": lambda r: f"✅ Found {r.get('count', 0)} VPN servers available",
         "check_data": lambda r: r.get('count', 0) > 0
     },
     "get_vpn_server_status": {
-        "on_success": lambda r: f"✅ Server {r['data']['server_id']} is {r['data']['status']}. Next: connect_to_vpn(server_id='{r['data']['server_id']}', mullvad_account='...')",
+        "on_success": lambda r: f"✅ Server {r['data']['server_id']} is {r['data']['status']} in {r['data']['location']}",
     },
     "connect_to_vpn": {
         "on_success": lambda r: _get_connection_guidance(r),
     },
     "get_current_connection_info": {
-        "on_success": lambda r: f"✅ Current IP: {r.get('current_ip', 'Unknown')} ({r.get('country', 'Unknown')}). Next: disconnect_vpn if done",
+        "on_success": lambda r: f"✅ Location: {r.get('country', 'Unknown')}, IP: {r.get('current_ip', 'Unknown')}" + (f", Connected to VPN: {r.get('vpn_server', 'none')}" if r.get('vpn_connected') else ""),
     },
     "disconnect_vpn": {
-        "on_success": lambda r: f"✅ Disconnected from {r.get('disconnect_info', {}).get('tunnel_name', 'Unknown')}. Workflow complete!",
+        "on_success": lambda r: f"✅ Disconnected from {r.get('disconnect_info', {}).get('tunnel_name', 'Unknown')}",
     }
 }
 
@@ -42,11 +42,12 @@ def _get_connection_guidance(response):
     """Generate guidance for connect_to_vpn based on connection status."""
     connection = response.get('connection', {})
     server_name = connection.get('server_name', 'Unknown')
+    server_id = connection.get('server_id', 'Unknown')
     
     if connection.get('test_mode'):
-        return f"⚠️ Connected to {server_name} in TEST MODE. Should use production mode with mullvad_account!"
+        return f"⚠️ Connected to {server_name} in TEST MODE - should use mullvad_account for production!"
     elif connection.get('authenticated'):
-        return f"✅ Connected to {server_name} with authentication. Next: get_current_connection_info"
+        return f"✅ Successfully connected to {server_id} ({server_name}) with Mullvad authentication"
     else:
         return f"❌ Connected to {server_name} WITHOUT authentication. Will not work!"
 
@@ -202,7 +203,7 @@ def run(user_message: str = None):
     
     # Main execution loop
     model_name = "gpt-4o-mini"
-    max_iterations = 5
+    max_iterations = 10
     
     for iteration in range(max_iterations):
         try:
@@ -211,11 +212,11 @@ def run(user_message: str = None):
             print(f"Iteration {iteration + 1} - Messages: {len(messages)}")
             print(f"{'='*60}\n")
             
-            log_gpt_request(messages, model_name, tools.tools)
+            log_gpt_request(messages, model_name, vpn_tools.tools)
             response = llm_vpn_client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                tools=tools.tools,
+                tools=vpn_tools.tools,
                 tool_choice="auto"
             )
             
@@ -230,6 +231,7 @@ def run(user_message: str = None):
                 print(f"\nGPT calling {len(tool_calls)} tool(s)...\n")
                 tool_count = 0
                 workflow_completed = False
+                guidance_messages = []  # Collect guidance to add AFTER all tool responses
                 
                 for tool_call in tool_calls:
                     # If workflow already completed, skip remaining tools but add dummy responses
@@ -262,12 +264,9 @@ def run(user_message: str = None):
                         "content": json.dumps(result['response'])
                     })
                     
-                    # Add guidance message
+                    # Collect guidance message (add AFTER all tool responses)
                     if result['guidance']:
-                        messages.append({
-                            "role": "assistant",
-                            "content": result['guidance']
-                        })
+                        guidance_messages.append(result['guidance'])
                     
                     tool_count += 1
                     
@@ -277,12 +276,20 @@ def run(user_message: str = None):
                         workflow_completed = True
                         print("✅ VPN connection established - skipping remaining tools in batch")
                 
+                # Add guidance messages AFTER all tool responses are added
+                if guidance_messages:
+                    combined_guidance = "\n".join(guidance_messages)
+                    messages.append({
+                        "role": "user",
+                        "content": f"Status update: {combined_guidance}"
+                    })
+                
                 print(f"\n✅ Completed {tool_count} tool(s)")
-                log_session_summary(total_requests=1, total_tools=tool_count)
                 
                 # Return immediately if workflow is complete
                 if workflow_completed:
                     print("✅ VPN workflow complete - returning to orchestrator!")
+                    log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
                     return _build_result(state, True, iteration + 1)
                 
                 print("Continuing to next iteration...\n")
@@ -294,11 +301,13 @@ def run(user_message: str = None):
                 print(f"\nGPT Response:\n{final_text}\n")
                 print("✅ LLM provided final response")
                 
+                log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
                 return _build_result(state, True, iteration + 1, final_text)
                 
         except Exception as e:
             log_error("LLM Execution failed", e)
             print(f"\nCRITICAL ERROR: {str(e)}")
+            log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
             return _build_result(state, False, iteration + 1, error=str(e))
     
     # Max iterations reached
@@ -308,6 +317,7 @@ def run(user_message: str = None):
     print(f"   VPN Disconnected: {state['vpn_disconnected']}")
     
     # Success if VPN was connected (even if not disconnected yet)
+    log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
     return _build_result(state, state['vpn_connected'], max_iterations)
 
 

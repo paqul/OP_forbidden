@@ -3,7 +3,7 @@ from prompts.system_prompts import main_system_prompt
 from openai import OpenAI
 import json
 import time
-import tools
+import vpn_tools
 import os
 import sys
 import llm_vpn_execution
@@ -44,7 +44,7 @@ available_agents = {
 
 def main():
     print("Running Main Orchestrator LLM...\n")
-    user_message = "Ask another LLM to connect to a VPN server in Germany with authentication, check the connection status, and provide the current public IP and location."
+    user_message = "Ask another LLM to connect to a VPN server in Greece with authentication, check the connection status, and provide the current public IP and location."
     log_user_request(user_message)
     
     messages = [

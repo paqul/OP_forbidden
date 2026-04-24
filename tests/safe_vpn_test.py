@@ -15,7 +15,7 @@ import ctypes
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from keys.projects_api_keys import MULLVAD_ACCOUNT
-from tools import (
+from vpn_tools import (
     list_vpn_servers,
     connect_to_vpn,
     disconnect_vpn,

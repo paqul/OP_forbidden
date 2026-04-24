@@ -3,7 +3,7 @@ import os
 import json
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tools import (
+from vpn_tools import (
     list_vpn_servers, 
     get_vpn_server_status, 
     connect_to_vpn, 

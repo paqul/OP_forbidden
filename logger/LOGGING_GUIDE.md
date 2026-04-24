@@ -48,7 +48,7 @@ Example log structure:
 ### Quick Start
 
 ```python
-from logs.logger_file import (
+from logger.logger_file import (
     log_user_request,
     log_gpt_request,
     log_gpt_response,
@@ -90,7 +90,7 @@ log_session_summary(total_requests=5, total_tools=12)
 ### Advanced Usage with LLMLogger Class
 
 ```python
-from logs.logger_file import LLMLogger
+from logger.logger_file import LLMLogger
 import logging
 
 # Create custom logger with DEBUG level
@@ -141,7 +141,7 @@ This keeps console clean while maintaining comprehensive file logs.
 
 ### Change Log Level
 ```python
-from logs.logger_file import LLMLogger
+from logger.logger_file import LLMLogger
 import logging
 
 # Show DEBUG messages in console too
