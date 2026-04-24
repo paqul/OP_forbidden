@@ -84,7 +84,7 @@ The Playwright browser automation infrastructure has been successfully integrate
 import playwright_tools
 
 # Launch browser (visible window)
-playwright_tools.launch_browser(browser_type="chromium", headless=False)
+playwright_tools.launch_browser(browser_type="webkit", headless=False)
 
 # Navigate and extract
 playwright_tools.navigate_to_url("https://example.com")

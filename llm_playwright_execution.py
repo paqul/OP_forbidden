@@ -216,7 +216,7 @@ def run(user_message: str = None):
     
     # Main execution loop
     model_name = "gpt-4o-mini"
-    max_iterations = 15
+    max_iterations = 8
     
     for iteration in range(max_iterations):
         try:

@@ -28,7 +28,7 @@ This downloads Chromium, Firefox, and WebKit browsers that Playwright controls.
 import playwright_tools
 
 # Launch browser (visible window by default)
-result = playwright_tools.launch_browser(browser_type="chromium", headless=False)
+result = playwright_tools.launch_browser(browser_type="webkit", headless=False)
 print(result)
 
 # Navigate to a website

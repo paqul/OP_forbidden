@@ -7,7 +7,7 @@ import playwright_tools
 import time
 
 print("Launching browser in visible mode...")
-result = playwright_tools.launch_browser(browser_type="chromium")
+result = playwright_tools.launch_browser(browser_type="webkit")
 
 print(f"\nBrowser launched!")
 print(f"  - Type: {result.get('browser_type')}")

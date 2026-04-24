@@ -1,5 +1,6 @@
 from keys.projects_api_keys import open_ai_api_key
 from prompts.system_prompts import main_system_prompt
+from prompts.user_prompts import inital_orchestrator_prompt
 from openai import OpenAI
 import json
 import time
@@ -10,6 +11,7 @@ import llm_vpn_execution
 import llm_playwright_execution
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
     log_tool_call_result, log_final_response, log_error, log_session_summary)
+
 
 main_client = OpenAI(api_key=open_ai_api_key)
 
@@ -25,11 +27,7 @@ agent_tools = [
                 "properties": {
                     "task_description": {
                         "type": "string",
-                        "description": "A clear description of the VPN task to perform (e.g., 'Connect to a VPN server in Germany and check connection status')"
-                    },
-                    "user_message": {
-                        "type": "string",
-                        "description": "The original user message/request for context"
+                        "description": "Complete description of the VPN task including ALL details (server location, authentication needs, specific actions)"
                     }
                 },
                 "required": ["task_description"]
@@ -40,17 +38,13 @@ agent_tools = [
         "type": "function",
         "function": {
             "name": "call_browser_agent",
-            "description": "Delegate browser automation and web scraping tasks to a specialized browser agent. Use this when the user asks to visit websites, scrape data, click elements, fill forms, take screenshots, or perform any browser automation. The agent has full Playwright automation capabilities.",
+            "description": "Delegate browser automation and web scraping tasks to a specialized browser agent. IMPORTANT: Include ALL URLs, selectors, and data extraction requirements in task_description. The agent needs complete information to execute.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "task_description": {
                         "type": "string",
-                        "description": "A clear description of the browser automation task to perform (e.g., 'Navigate to YouTube and take a screenshot of the homepage')"
-                    },
-                    "user_message": {
-                        "type": "string",
-                        "description": "The original user message/request for context"
+                        "description": "Complete description of the browser task including ALL details: URLs (full https://...), elements to find, data to extract, screenshots needed, interactions required"
                     }
                 },
                 "required": ["task_description"]
@@ -59,17 +53,15 @@ agent_tools = [
     }
 ]
 
-# Available agent functions
+# Available agent functions - Always use task_description (it has all the details)
 available_agents = {
-    "call_vpn_agent": lambda task_description, user_message=None: llm_vpn_execution.run(user_message or task_description),
-    "call_browser_agent": lambda task_description, user_message=None: llm_playwright_execution.run(user_message or task_description)
+    "call_vpn_agent": lambda task_description: llm_vpn_execution.run(task_description),
+    "call_browser_agent": lambda task_description: llm_playwright_execution.run(task_description)
 }
 
 def main():
     print("Running Main Orchestrator LLM...\n")
-    user_message = "Ask another LLM to connect to a VPN server in Spain with authentication," \
-    "Then navigate to YouTube video https://www.youtube.com/watch?v=ULjo6JaFTWg, " \
-    "extract the video title and description, and take a screenshot of the page. Click button play and verify video is playing for 10 seconds, then disconnect VPN."
+    user_message = inital_orchestrator_prompt 
     log_user_request(user_message)
     
     messages = [
