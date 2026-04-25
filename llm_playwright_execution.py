@@ -3,11 +3,24 @@ from prompts.system_prompts import playwright_prompt
 from openai import OpenAI
 import json
 import time
+import random
 import playwright_tools
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
     log_tool_call_result, log_final_response, log_error, log_session_summary)
 
 llm_playwright_client = OpenAI(api_key=open_ai_api_key)
+
+# Anti-bot detection: Random delays before operations (seconds)
+MIN_DELAY = 5
+MAX_DELAY = 16
+
+# Functions that should have human-like delays
+DELAYED_FUNCTIONS = {
+    "navigate_to_url",
+    "click_element",
+    "type_text",
+    "handle_consent_dialog",
+}
 
 available_functions = {
     "launch_browser": playwright_tools.launch_browser,
@@ -134,6 +147,12 @@ def _execute_tool(tool_call, state):
     """Execute a single tool call and handle results."""
     function_name = tool_call.function.name
     function_args = json.loads(tool_call.function.arguments)
+    
+    # Add random human-like delay before certain operations
+    if function_name in DELAYED_FUNCTIONS:
+        delay = random.uniform(MIN_DELAY, MAX_DELAY)
+        print(f"\n⏱️  Human-like delay: {delay:.1f} seconds (avoiding bot detection)...")
+        time.sleep(delay)
     
     log_tool_call_start(function_name, function_args)
     print(f"Executing: {function_name}({function_args})")
