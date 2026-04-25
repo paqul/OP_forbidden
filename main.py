@@ -69,7 +69,7 @@ def main():
         {"role": "user", "content": user_message}
     ]
     
-    model_name = "gpt-4o-mini"
+    model_name = "gpt-4o"
     max_iterations = 10
     
     for iteration in range(max_iterations):

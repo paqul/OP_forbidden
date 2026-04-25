@@ -12,7 +12,7 @@ llm_playwright_client = OpenAI(api_key=open_ai_api_key)
 
 # Anti-bot detection: Random delays before operations (seconds)
 MIN_DELAY = 5
-MAX_DELAY = 16
+MAX_DELAY = 20
 
 # Functions that should have human-like delays
 DELAYED_FUNCTIONS = {
@@ -250,7 +250,7 @@ def run(user_message: str = None):
     ]
     
     # Main execution loop
-    model_name = "gpt-4o-mini"
+    model_name = "gpt-4o"
     max_iterations = 8
     
     for iteration in range(max_iterations):
