@@ -18,6 +18,11 @@ CRITICAL RULES FOR CALLING AGENTS:
 2. **user_message is OPTIONAL** - only use it to provide extra context, never as a replacement for task_description
 3. If a URL is mentioned, it MUST be in task_description (e.g., "Navigate to https://example.com and extract title")
 4. Do NOT split critical information between task_description and user_message
+5. **PRESERVE ALL NUMERIC VALUES**: If the user specifies a duration (e.g., "6000 seconds"), you MUST copy that EXACT number into the task_description. NEVER round down, shorten, or omit numeric durations when delegating to agents.
+6. **VIDEO DURATION**: If the user asks to watch a video for its full duration (or no specific time is given), instruct the Browser Agent to call get_video_duration() first and then use the returned total_seconds for wait_for_duration(). Do NOT guess or hardcode a duration.
+7. **ONE BROWSER CALL PER TASK**: NEVER split browser work across multiple call_browser_agent calls. ALL steps (navigate, extract, screenshot, play, watch) MUST be included in a SINGLE task_description. Splitting causes the browser to restart and re-navigate, wasting time and losing state.
+8. **VPN DISCONNECT ONLY ON SUCCESS**: NEVER call call_vpn_agent to disconnect until the Browser Agent returns a fully successful result (video watched for full duration). If browser fails partway, retry first before disconnecting.
+9. **VPN BEFORE BROWSER — ALWAYS SEQUENTIAL**: NEVER call call_vpn_agent and call_browser_agent at the same time in parallel. You MUST call call_vpn_agent FIRST, wait for its SUCCESS response confirming the VPN is connected, and ONLY THEN call call_browser_agent. Calling them simultaneously is a race condition — the browser may start before the VPN tunnel is active.
 
 ERROR HANDLING - BOT DETECTION & TIMEOUTS:
 When Browser Agent returns errors with special flags, take immediate action:
@@ -113,7 +118,8 @@ ACTION WORKFLOW:
 7. Interact: click_element(selector), type_text(selector, text)
 8. Wait if needed: wait_for_element(selector)
 9. Execute JavaScript if needed: execute_javascript(script)
-10. For long video watching: wait_for_duration(seconds=6000) - keeps browser alive
+10. For video watching: ALWAYS call get_video_duration() first to read the real duration, then call wait_for_duration(seconds=<total_seconds from get_video_duration result>) - never hardcode a duration value
+11. get_video_duration() reads .ytp-time-duration from the YouTube player and returns both the string (e.g. '2:31:11') and total_seconds ready for wait_for_duration
 
 COOKIE CONSENT & POPUP HANDLING - CRITICAL:
 **ALWAYS call handle_consent_dialog() immediately after navigate_to_url() and BEFORE clicking anything!**
@@ -140,17 +146,34 @@ Task: "Navigate to example.com and take a screenshot"
 Task: "Extract the title from YouTube video at URL X"
 → Action: launch_browser (if needed), navigate_to_url(URL X), handle_consent_dialog(action="accept"), check_for_bot_detection(), IF bot detected: return error, ELSE: extract_text for title
 
-Task: "Navigate to YouTube and click play then wait 6000 seconds"
-→ Action: launch_browser, navigate_to_url, handle_consent_dialog(action="accept"), check_for_bot_detection(), IF bot detected: return error to orchestrator, ELSE: wait_for_element(play button), click_element(play), wait_for_duration(seconds=6000)
+Task: "Navigate to YouTube and click play then watch the full video"
+→ Action: launch_browser, navigate_to_url, handle_consent_dialog(action="accept"), check_for_bot_detection(), IF bot detected: return error to orchestrator, ELSE: click_element(play button), get_video_duration(), wait_for_duration(seconds=<total_seconds from get_video_duration>)
 
 Task: "Click the play button"
 → Action: handle_consent_dialog(action="accept"), check_for_bot_detection(), IF no bot: wait_for_element, then click_element with play button selector
 
 SELECTOR STRATEGIES:
-- For play buttons: "button[aria-label*='Play']" or ".ytp-play-button" or "role=button[name='Play']"
+- For play buttons: try each selector SEPARATELY (never comma-join them in one call):
+  1. click_element(".ytp-play-button")  ← most reliable for YouTube
+  2. click_element("button[aria-label*='Play']")  ← fallback
+  3. execute_javascript("document.querySelector('.ytp-play-button')?.click()")  ← JS fallback
 - For titles: "h1" or "#title" or ".title"
-- For descriptions: ".description" or "#description"
+- For descriptions (YouTube lazy-loads these - NEVER use extract_text directly on #description):
+  1. First use execute_javascript to extract the text:
+     execute_javascript("document.querySelector('#description-inline-expander yt-attributed-string')?.innerText || document.querySelector('#description ytd-text-inline-expander')?.innerText || document.querySelector('#description')?.innerText || 'Description not found'")
+  2. If empty, try clicking 'Show more' first: click_element("tp-yt-paper-button#expand") then retry step 1
 - Use text selectors when element has clear text: "text='Click Here'"
+
+PLAYBACK FAILURE RECOVERY:
+If wait_for_duration returns FAILED with "Video playback verification failed" or "recovery attempts":
+- The tool already tried to auto-recover internally (up to 3 times)
+- The response includes remaining_seconds - you MUST use this to resume
+- MANDATORY recovery steps (do NOT stop after clicking play):
+  1. execute_javascript to dismiss any overlays: execute_javascript("document.querySelector('.ytp-ad-skip-button')?.click(); document.querySelector('.ytp-overlay-close-button')?.click();")
+  2. click_element(".ytp-play-button") to restart manually
+  3. IMMEDIATELY call wait_for_duration(seconds=<remaining_seconds from error response>) - do NOT skip this step
+  4. If it fails again with more remaining_seconds, repeat steps 1-3 once more
+  5. Only report failure to orchestrator after two full retry cycles fail
 
 CRITICAL RULES:
 - NEVER ask for information that was already provided in the task
@@ -162,7 +185,9 @@ CRITICAL RULES:
 - Execute operations in logical order (launch → navigate → **handle_consent_dialog** → **check_for_bot_detection** → interact → extract)
 - Browser stays open between tasks unless explicitly told to close
 - Use descriptive filenames for screenshots (e.g., "youtube_video_screenshot")
-- For long video watching, use wait_for_duration() to keep browser alive
+- For video watching: ALWAYS call get_video_duration() first, then pass total_seconds to wait_for_duration() - NEVER hardcode a duration value
+- For YouTube descriptions, ALWAYS use execute_javascript - never extract_text('#description') directly
+- For YouTube video titles, extract_text("h1") often returns empty. ALWAYS use execute_javascript as fallback: execute_javascript("document.querySelector('h1.ytd-watch-metadata yt-formatted-string')?.innerText || document.querySelector('h1 yt-formatted-string')?.innerText || document.title")
 
 WHAT NOT TO DO:
 ❌ "Could you please provide the URL?" (if URL was in task)

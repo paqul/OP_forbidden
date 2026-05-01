@@ -275,13 +275,13 @@ tools = [
         "type": "function",
         "function": {
             "name": "wait_for_duration",
-            "description": "Keep browser alive and wait for specified duration. Use this to monitor video playback, keep page open, or verify long-running processes. Prints progress updates every 30 seconds. IMPORTANT: Use this after starting video to keep it playing. Returns JSON with wait status.",
+            "description": "Keep browser alive and wait for specified duration. Use this to monitor video playback, keep page open, or verify long-running processes. Prints progress updates every 3 seconds. IMPORTANT: Use this after starting video to keep it playing. Has built-in tiered auto-recovery if video pauses: attempt 1 = JS video.play() + click play button; attempt 2 = page reload + seek to elapsed position + click play; attempt 3 = full page reload + click play. On failure, returns remaining_seconds so you can re-click play and call this again. Returns JSON with wait status.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "seconds": {
                         "type": "integer",
-                        "description": "Number of seconds to wait (e.g., 5000 for ~66 minutes)"
+                        "description": "Number of seconds to wait (e.g., 5000 for ~66 minutes). CRITICAL: Use the EXACT value specified by the user or orchestrator. Do NOT substitute a shorter value (e.g., do NOT use 30 if the user said 6000)."
                     },
                     "verify_playing": {
                         "type": "boolean",
@@ -289,10 +289,30 @@ tools = [
                     },
                     "check_interval": {
                         "type": "integer",
-                        "description": "Seconds between status checks (default: 30)"
+                        "description": "Seconds between status checks (default: 3)"
+                    },
+                    "auto_recover": {
+                        "type": "boolean",
+                        "description": "Automatically attempt to resume video if paused (e.g. after an ad). Uses JS video.play() and clicks the play button. Default: True."
+                    },
+                    "max_recovery_attempts": {
+                        "type": "integer",
+                        "description": "Maximum auto-recovery attempts before giving up (default: 3)"
                     }
                 },
                 "required": ["seconds"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_video_duration",
+            "description": "Read the total duration of a video currently loaded in the browser from the YouTube player element (.ytp-time-duration). Returns the duration as a human-readable string (e.g. '2:31:11') and as total seconds. Use this before wait_for_duration to know the exact video length to wait for.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
             }
         }
     },
@@ -832,79 +852,212 @@ def reset_timeout_counter() -> Dict:
     }
 
 
-def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval: int = 30) -> Dict:
+def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval: int = 3,
+                      auto_recover: bool = True, max_recovery_attempts: int = 3) -> Dict:
     """
     Keep browser alive and wait for specified duration.
     Useful for monitoring video playback or keeping page open.
+    Includes auto-recovery: if video pauses (e.g. due to ads or buffering),
+    attempts to resume playback via JS before giving up.
     """
     check_success, check_error = _ensure_browser_running()
     if not check_success:
         return {"success": False, "error": check_error}
-    
+
     try:
         start_time = time.time()
         elapsed = 0
         checks_performed = 0
-        
+        total_recovery_attempts = 0   # cumulative across entire session (for reporting)
+        per_event_attempt = 0         # resets to 0 after each successful recovery
+        consecutive_failures = 0
+
         print(f"\n⏱️  Starting wait for {seconds} seconds ({seconds/60:.1f} minutes)...")
         print(f"   Browser will stay open and page will remain active")
         if verify_playing:
-            print(f"   Checking video playback status every {check_interval} seconds\n")
-        
+            print(f"   Checking video playback status every {check_interval} seconds")
+            if auto_recover:
+                print(f"   Auto-recovery enabled (max {max_recovery_attempts} attempts)\n")
+
         while elapsed < seconds:
             # Calculate remaining time
             remaining = seconds - elapsed
-            
+
             # Wait for check_interval or remaining time (whichever is smaller)
             sleep_time = min(check_interval, remaining)
             time.sleep(sleep_time)
-            
+
             elapsed = time.time() - start_time
             checks_performed += 1
-            
+
             # Progress update
             progress_pct = (elapsed / seconds) * 100
             print(f"⏳ [{progress_pct:5.1f}%] Elapsed: {int(elapsed)}s / {seconds}s  |  Remaining: {int(seconds - elapsed)}s")
-            
+
             # Verify video is still playing (if requested)
             if verify_playing and elapsed < seconds:
                 try:
-                    # Check if video element exists and is playing
                     is_playing = _page_instance.evaluate("""
                         () => {
                             const video = document.querySelector('video');
                             if (video) {
-                                return !video.paused && !video.ended && video.readyState > 2;
+                                // readyState > 2 removed: a buffering video (readyState==2)
+                                // is not paused, just waiting for data — don't falsely trigger recovery
+                                return !video.paused && !video.ended;
                             }
                             return false;
                         }
                     """)
-                    
+
                     if is_playing:
                         print(f"   ✅ Video is playing")
+                        consecutive_failures = 0
+                        per_event_attempt = 0   # reset per-event counter on success
                     else:
-                        print(f"   ⚠️  Warning: Video may not be playing")
-                        return {
-                            "success": False,
-                            "error": "Video playback verification failed - video paused or ended",
-                            "elapsed_seconds": int(elapsed),
-                            "total_seconds": seconds,
-                            "checks_performed": checks_performed
-                        }
+                        consecutive_failures += 1
+                        print(f"   ⚠️  Video not playing (failure #{consecutive_failures})")
+
+                        # Require 2 consecutive failures before triggering recovery.
+                        # A single blip (ad transition, brief buffer) must not cause a page reload.
+                        if consecutive_failures < 2:
+                            print(f"   ⏳ Waiting for next check before acting (may be transient)...")
+                        elif auto_recover and per_event_attempt < max_recovery_attempts:
+                            per_event_attempt += 1
+                            total_recovery_attempts += 1
+                            print(f"   🔄 Auto-recovery attempt {per_event_attempt}/{max_recovery_attempts} (total: {total_recovery_attempts})...")
+                            try:
+                                # Strategy 1 (per-event attempt 1): JS video.play() + click play button
+                                if per_event_attempt == 1:
+                                    print(f"   🎯 Strategy 1: dismiss overlays + JS play() + click play button")
+                                    _page_instance.evaluate("""
+                                        () => {
+                                            // Dismiss ads and overlays first
+                                            document.querySelector('.ytp-ad-skip-button')?.click();
+                                            document.querySelector('.ytp-ad-skip-button-modern')?.click();
+                                            document.querySelector('.ytp-overlay-close-button')?.click();
+                                            document.querySelector('tp-yt-paper-dialog .close-button')?.click();
+                                            document.querySelector('ytd-enforcement-message-view-model button')?.click();
+                                            // Now attempt to play
+                                            const video = document.querySelector('video');
+                                            if (video && video.paused) { video.play(); }
+                                            const playBtn = document.querySelector('.ytp-play-button') ||
+                                                            document.querySelector('button[aria-label*="Play"]') ||
+                                                            document.querySelector('button[aria-label*="play"]');
+                                            if (playBtn) { playBtn.click(); }
+                                        }
+                                    """)
+                                    time.sleep(3)
+
+                                # Strategy 2 (per-event attempt 2): Reload page, seek to elapsed time, click play
+                                elif per_event_attempt == 2:
+                                    print(f"   🎯 Strategy 2: Reload page + dismiss overlays + seek to {int(elapsed)}s + click play")
+                                    _page_instance.reload(wait_until="domcontentloaded")
+                                    time.sleep(5)
+                                    # Dismiss any overlays after reload, seek to elapsed position
+                                    _page_instance.evaluate(f"""
+                                        () => {{
+                                            document.querySelector('.ytp-ad-skip-button')?.click();
+                                            document.querySelector('.ytp-ad-skip-button-modern')?.click();
+                                            document.querySelector('.ytp-overlay-close-button')?.click();
+                                            document.querySelector('tp-yt-paper-dialog .close-button')?.click();
+                                            document.querySelector('ytd-enforcement-message-view-model button')?.click();
+                                            const video = document.querySelector('video');
+                                            if (video) {{
+                                                video.currentTime = {int(elapsed)};
+                                                video.play();
+                                            }}
+                                            const playBtn = document.querySelector('.ytp-play-button') ||
+                                                            document.querySelector('button[aria-label*="Play"]') ||
+                                                            document.querySelector('button[aria-label*="play"]');
+                                            if (playBtn) {{ playBtn.click(); }}
+                                        }}
+                                    """)
+                                    time.sleep(5)
+
+                                # Strategy 3 (per-event attempt 3): Full reload, no seek, dismiss overlays, click play
+                                else:
+                                    print(f"   🎯 Strategy 3: Full page reload + dismiss overlays + click play (last resort)")
+                                    _page_instance.reload(wait_until="load")
+                                    time.sleep(8)
+                                    _page_instance.evaluate("""
+                                        () => {
+                                            document.querySelector('.ytp-ad-skip-button')?.click();
+                                            document.querySelector('.ytp-ad-skip-button-modern')?.click();
+                                            document.querySelector('.ytp-overlay-close-button')?.click();
+                                            document.querySelector('tp-yt-paper-dialog .close-button')?.click();
+                                            document.querySelector('ytd-enforcement-message-view-model button')?.click();
+                                            const video = document.querySelector('video');
+                                            if (video) { video.play(); }
+                                            const playBtn = document.querySelector('.ytp-play-button') ||
+                                                            document.querySelector('button[aria-label*="Play"]') ||
+                                                            document.querySelector('button[aria-label*="play"]');
+                                            if (playBtn) { playBtn.click(); }
+                                        }
+                                    """)
+                                    time.sleep(5)
+
+                                is_recovered = _page_instance.evaluate("""
+                                    () => {
+                                        const video = document.querySelector('video');
+                                        if (video) {
+                                            return !video.paused && !video.ended;
+                                        }
+                                        return false;
+                                    }
+                                """)
+                                if is_recovered:
+                                    print(f"   ✅ Auto-recovery successful! Video is playing again.")
+                                    consecutive_failures = 0
+                                    per_event_attempt = 0   # reset so next stall starts from Strategy 1
+                                else:
+                                    print(f"   ❌ Recovery attempt {per_event_attempt} failed.")
+                                    if per_event_attempt >= max_recovery_attempts:
+                                        return {
+                                            "success": False,
+                                            "error": f"Video playback failed after {per_event_attempt} recovery attempts for this stall event",
+                                            "elapsed_seconds": int(elapsed),
+                                            "total_seconds": seconds,
+                                            "remaining_seconds": int(seconds - elapsed),
+                                            "checks_performed": checks_performed,
+                                            "total_recovery_attempts": total_recovery_attempts
+                                        }
+                            except Exception as re:
+                                print(f"   ⚠️  Recovery error: {str(re)}")
+                                if per_event_attempt >= max_recovery_attempts:
+                                    return {
+                                        "success": False,
+                                        "error": f"Video playback recovery error: {str(re)}",
+                                        "elapsed_seconds": int(elapsed),
+                                        "total_seconds": seconds,
+                                        "remaining_seconds": int(seconds - elapsed),
+                                        "checks_performed": checks_performed,
+                                        "total_recovery_attempts": total_recovery_attempts
+                                    }
+                        else:
+                            return {
+                                "success": False,
+                                "error": "Video playback verification failed - video paused or ended (auto_recover disabled or not configured)",
+                                "elapsed_seconds": int(elapsed),
+                                "total_seconds": seconds,
+                                "remaining_seconds": int(seconds - elapsed),
+                                "checks_performed": checks_performed,
+                                "total_recovery_attempts": total_recovery_attempts
+                            }
                 except Exception as e:
                     print(f"   ⚠️  Could not verify video playback: {str(e)}")
-        
+
         total_elapsed = time.time() - start_time
         print(f"\n✅ Wait completed! Total time: {int(total_elapsed)}s ({total_elapsed/60:.1f} minutes)\n")
-        
+
         return {
             "success": True,
             "elapsed_seconds": int(total_elapsed),
             "requested_seconds": seconds,
             "checks_performed": checks_performed,
+            "total_recovery_attempts": total_recovery_attempts,
             "message": f"Successfully waited {int(total_elapsed)} seconds"
         }
-        
+
     except KeyboardInterrupt:
         elapsed = time.time() - start_time
         print(f"\n⚠️  Wait interrupted by user after {int(elapsed)} seconds\n")
@@ -919,6 +1072,52 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
             "success": False,
             "error": f"Wait failed: {str(e)}"
         }
+
+
+def get_video_duration() -> Dict:
+    """
+    Read the total duration of the currently loaded video from the YouTube
+    player element (.ytp-time-duration). Returns duration as a string and
+    as total seconds for direct use with wait_for_duration.
+    """
+    check_success, check_error = _ensure_browser_running()
+    if not check_success:
+        return {"success": False, "error": check_error}
+
+    try:
+        duration_text = _page_instance.evaluate("""
+            () => {
+                const el = document.querySelector('.ytp-time-duration');
+                return el ? el.innerText.trim() : null;
+            }
+        """)
+
+        if not duration_text:
+            return {
+                "success": False,
+                "error": "Duration element (.ytp-time-duration) not found. Ensure a video is loaded and the player is visible."
+            }
+
+        # Parse H:MM:SS or MM:SS into total seconds
+        parts = duration_text.strip().split(':')
+        parts = [int(p) for p in parts]
+        if len(parts) == 3:
+            total_seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+        elif len(parts) == 2:
+            total_seconds = parts[0] * 60 + parts[1]
+        else:
+            total_seconds = parts[0]
+
+        print(f"🎬 Video duration: {duration_text} ({total_seconds} seconds)")
+        return {
+            "success": True,
+            "duration": duration_text,
+            "total_seconds": total_seconds,
+            "message": f"Video duration is {duration_text} ({total_seconds} seconds). Use wait_for_duration(seconds={total_seconds}) to watch the full video."
+        }
+
+    except Exception as e:
+        return {"success": False, "error": f"Failed to read video duration: {str(e)}"}
 
 
 def handle_consent_dialog(action: str = "accept", timeout: int = 5000) -> Dict:

@@ -37,6 +37,7 @@ available_functions = {
     "wait_for_duration": playwright_tools.wait_for_duration,
     "handle_consent_dialog": playwright_tools.handle_consent_dialog,
     "check_for_bot_detection": playwright_tools.check_for_bot_detection,
+    "get_video_duration": playwright_tools.get_video_duration,
 }
 
 # Configuration for tool guidance messages (data-driven approach)
@@ -82,6 +83,9 @@ TOOL_GUIDANCE = {
     },
     "check_for_bot_detection": {
         "on_success": lambda r: f"✅ No bot detection found - page is accessible",
+    },
+    "get_video_duration": {
+        "on_success": lambda r: f"✅ Video duration: {r.get('duration', 'unknown')} ({r.get('total_seconds', 0)} seconds)",
     }
 }
 
