@@ -11,8 +11,8 @@ from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_respo
 llm_playwright_client = OpenAI(api_key=open_ai_api_key)
 
 # Anti-bot detection: Random delays before operations (seconds)
-MIN_DELAY = 5
-MAX_DELAY = 20
+MIN_DELAY = 2
+MAX_DELAY = 12
 
 # Functions that should have human-like delays
 DELAYED_FUNCTIONS = {
@@ -152,11 +152,19 @@ def _execute_tool(tool_call, state):
     function_name = tool_call.function.name
     function_args = json.loads(tool_call.function.arguments)
     
-    # Add random human-like delay before certain operations
-    if function_name in DELAYED_FUNCTIONS:
+    # Add random human-like delay before certain operations.
+    # Skip the delay if this is a retry of a recently failed call with the same function.
+    last_same_call = next(
+        (t for t in reversed(state['tools_executed']) if t['name'] == function_name),
+        None
+    )
+    is_retry = last_same_call is not None and not last_same_call['success']
+    if function_name in DELAYED_FUNCTIONS and not is_retry:
         delay = random.uniform(MIN_DELAY, MAX_DELAY)
         print(f"\n⏱️  Human-like delay: {delay:.1f} seconds (avoiding bot detection)...")
         time.sleep(delay)
+    elif is_retry and function_name in DELAYED_FUNCTIONS:
+        print(f"\n⚡ Skipping delay — retrying failed {function_name}")
     
     log_tool_call_start(function_name, function_args)
     print(f"Executing: {function_name}({function_args})")
@@ -255,7 +263,7 @@ def run(user_message: str = None):
     
     # Main execution loop
     model_name = "gpt-4o"
-    max_iterations = 8
+    max_iterations = 20
     
     for iteration in range(max_iterations):
         try:
@@ -337,11 +345,18 @@ def run(user_message: str = None):
             log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
             return _build_result(state, False, iteration + 1, error=str(e))
     
-    # Max iterations reached
+    # Max iterations reached — ensure browser is released
     print(f"\n⚠️  Maximum iterations ({max_iterations}) reached")
     print(f"   Tools executed: {len(state['tools_executed'])}")
     print(f"   Browser launched: {state['browser_launched']}")
     print(f"   Browser closed: {state['browser_closed']}")
+    if state['browser_launched'] and not state['browser_closed']:
+        print("   🧹 Closing browser to free resources...")
+        try:
+            playwright_tools.close_browser()
+            state['browser_closed'] = True
+        except Exception:
+            pass
     
     log_session_summary(total_requests=1, total_tools=len(state['tools_executed']))
     return _build_result(state, state['browser_launched'], max_iterations)

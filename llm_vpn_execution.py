@@ -3,11 +3,53 @@ from prompts.system_prompts import vpn_prompt
 from openai import OpenAI
 import json
 import time
+import urllib.request
 import vpn_tools
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
     log_tool_call_result, log_final_response, log_error, log_session_summary)
 
 llm_vpn_client = OpenAI(api_key=open_ai_api_key)
+
+
+def _get_public_ip(timeout: int = 8) -> str | None:
+    """Return the current public IP or None on failure."""
+    try:
+        req = urllib.request.Request(
+            "https://api.ipify.org",
+            headers={"User-Agent": "Mozilla/5.0"}
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return None
+
+
+def _verify_vpn_active(ip_before: str | None) -> dict:
+    """
+    Confirm that traffic is actually routed through the VPN by checking that
+    the public IP changed after connecting.  Returns a result dict.
+
+    Verification requires BOTH a known baseline AND a changed IP:
+    - If ip_before was never captured (network was down before connecting),
+      we cannot confirm anything → verified=False.
+    - If ip_after cannot be fetched, the service is unreachable → verified=False.
+    - If the IP did not change, traffic is not going through the VPN → verified=False.
+    """
+    if ip_before is None:
+        return {
+            "verified": False,
+            "reason": "Baseline IP was not captured before connecting — cannot confirm VPN routing"
+        }
+    ip_after = _get_public_ip()
+    if ip_after is None:
+        return {"verified": False, "reason": "Could not reach IP-check service after connecting"}
+    if ip_after == ip_before:
+        return {
+            "verified": False,
+            "reason": f"Public IP did not change ({ip_after}) — traffic may not be routed through VPN",
+            "ip": ip_after
+        }
+    return {"verified": True, "ip_before": ip_before, "ip_after": ip_after}
 
 available_functions = {
     "list_vpn_servers": vpn_tools.list_vpn_servers,
@@ -86,12 +128,23 @@ def _track_vpn_status(function_name, response, state):
         state['vpn_connected'] = True
         connection_info = response.get('connection', {})
         state['connection_info'] = connection_info
-        
+
+        # Verify traffic is actually routed through VPN by checking public IP changed
+        print("   🌐 Verifying VPN traffic routing via public IP check...")
+        ip_check = _verify_vpn_active(state.get('_ip_before'))
+        state['vpn_ip_verified'] = ip_check['verified']
+        state['ip_check'] = ip_check
+        if ip_check['verified']:
+            print(f"   ✅ IP verified: {ip_check.get('ip_before')} → {ip_check.get('ip_after')}")
+        else:
+            print(f"   ⚠️  IP verification failed: {ip_check.get('reason')}")
+
         status = "Authenticated ✅" if connection_info.get('authenticated') else "Test mode"
         _print_status_banner("VPN CONNECTION ESTABLISHED!", {
             "Server": connection_info.get('server_name', 'Unknown'),
             "Tunnel": connection_info.get('tunnel_name', 'Unknown'),
-            "Status": status
+            "Status": status,
+            "IP Verified": "✅ Yes" if ip_check['verified'] else f"⚠️  No — {ip_check.get('reason', '')}"
         })
     
     elif function_name == "disconnect_vpn" and response.get('success'):
@@ -156,8 +209,8 @@ def _execute_tool(tool_call, state):
 
 def _is_workflow_complete(state):
     """Check if VPN workflow is complete."""
-    # Return as soon as VPN connection is successful (don't wait for disconnection)
-    return state['vpn_connected']
+    # Require both successful connection AND that traffic is actually routed through VPN
+    return state['vpn_connected'] and state.get('vpn_ip_verified', False)
 
 
 def _build_result(state, success, iterations, final_response=None, error=None):
@@ -165,6 +218,7 @@ def _build_result(state, success, iterations, final_response=None, error=None):
     return {
         "success": success,
         "vpn_connected": state['vpn_connected'],
+        "vpn_ip_verified": state.get('vpn_ip_verified', False),
         "vpn_disconnected": state['vpn_disconnected'],
         "connection_info": state.get('connection_info'),
         "disconnect_info": state.get('disconnect_info'),
@@ -181,11 +235,18 @@ def run(user_message: str = None):
     # Initialize state
     state = {
         'vpn_connected': False,
+        'vpn_ip_verified': False,
         'vpn_disconnected': False,
         'connection_info': None,
         'disconnect_info': None,
         'tools_executed': [],
     }
+
+    # Snapshot public IP before connecting so we can verify it changes
+    ip_before = _get_public_ip()
+    if ip_before:
+        print(f"   🌐 Public IP before VPN: {ip_before}")
+    state['_ip_before'] = ip_before
     
     # Setup initial message
     if not user_message:

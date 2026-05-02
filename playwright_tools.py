@@ -2,9 +2,14 @@ import os
 import json
 import asyncio
 import time
+import base64
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
+from openai import OpenAI
+from keys.projects_api_keys import open_ai_api_key
+
+_vision_client = OpenAI(api_key=open_ai_api_key)
 
 # Screenshot and data storage paths
 SCREENSHOTS_DIR = Path(__file__).parent / "screenshots"
@@ -23,6 +28,8 @@ _current_browser_type = None  # Track which browser is running
 
 # Timeout tracking for orchestrator
 _timeout_count = 0  # Track consecutive timeouts
+# Track last navigated URL so wait_for_duration can re-navigate after a browser crash
+_last_navigated_url = None
 
 
 tools = [
@@ -275,7 +282,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "wait_for_duration",
-            "description": "Keep browser alive and wait for specified duration. Use this to monitor video playback, keep page open, or verify long-running processes. Prints progress updates every 3 seconds. IMPORTANT: Use this after starting video to keep it playing. Has built-in tiered auto-recovery if video pauses: attempt 1 = JS video.play() + click play button; attempt 2 = page reload + seek to elapsed position + click play; attempt 3 = full page reload + click play. On failure, returns remaining_seconds so you can re-click play and call this again. Returns JSON with wait status.",
+            "description": "Keep browser alive and wait for specified duration. Use this to monitor video playback, keep page open, or verify long-running processes. Prints progress updates every 3 seconds. IMPORTANT: Use this after starting video to keep it playing. Has built-in tiered auto-recovery if video pauses: attempt 1 = JS video.play() + click play button; attempt 2 = page reload + seek to elapsed position + click play; attempt 3 = full page reload + click play. Also performs periodic GPT-4o vision checks (screenshot analysis) to detect and react to dialogs, ads, or errors not caught by JS. On failure, returns remaining_seconds so you can re-click play and call this again. Returns JSON with wait status.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -298,6 +305,10 @@ tools = [
                     "max_recovery_attempts": {
                         "type": "integer",
                         "description": "Maximum auto-recovery attempts before giving up (default: 3)"
+                    },
+                    "vision_check_interval": {
+                        "type": "integer",
+                        "description": "Seconds between GPT-4o vision screenshot checks (default: 60). Vision checks detect dialogs, ads, or errors that JS cannot. Set to 0 to disable."
                     }
                 },
                 "required": ["seconds"]
@@ -369,7 +380,22 @@ def _ensure_browser_running() -> tuple:
         return False, f"Browser connection lost: {str(e)}"
 
 
-def launch_browser(browser_type: str = "chromium", headless: bool = False, 
+def _ping_page() -> bool:
+    """
+    Return True if the current page connection is alive, False if it is dead.
+    A lightweight check used inside long-running loops to detect unexpected browser crashes.
+    """
+    global _page_instance
+    if _page_instance is None:
+        return False
+    try:
+        _page_instance.evaluate("() => 1")
+        return True
+    except Exception:
+        return False
+
+
+def launch_browser(browser_type: str = "chromium", headless: bool = False,
                    viewport_width: int = 1920, viewport_height: int = 1080) -> Dict:
     """
     Launch a browser instance with Playwright.
@@ -446,7 +472,7 @@ def navigate_to_url(url: str, wait_until: str = "load", timeout: int = 30000) ->
     Navigate to a URL and wait for page to load.
     Returns timeout information that orchestrator can use to decide on VPN switch.
     """
-    global _timeout_count
+    global _timeout_count, _last_navigated_url
     
     check_success, check_error = _ensure_browser_running()
     if not check_success:
@@ -461,6 +487,7 @@ def navigate_to_url(url: str, wait_until: str = "load", timeout: int = 30000) ->
         
         # Reset timeout count on success
         _timeout_count = 0
+        _last_navigated_url = url  # remember for browser crash recovery
         
         return {
             "success": True,
@@ -852,8 +879,73 @@ def reset_timeout_counter() -> Dict:
     }
 
 
+def _vision_check_screen() -> Dict:
+    """
+    Take a screenshot of the current page and ask GPT-4o vision what is happening
+    and what action (if any) should be taken to resume playback.
+    Returns a dict with keys:
+      - 'status': 'playing' | 'paused' | 'ad' | 'dialog' | 'error' | 'unknown'
+      - 'action': JS snippet to execute (empty string if no action needed)
+      - 'description': human-readable description of what was seen
+    """
+    try:
+        # Capture screenshot as bytes (no file needed)
+        img_bytes = _page_instance.screenshot(type="jpeg", quality=60)
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
+
+        response = _vision_client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=400,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a browser automation assistant monitoring a YouTube video. "
+                        "Analyze the screenshot and return a JSON object with exactly these fields:\n"
+                        "  status: one of 'playing', 'paused', 'ad', 'dialog', 'error', 'unknown'\n"
+                        "  action: a single-line JavaScript snippet to fix the problem (empty string if none needed)\n"
+                        "  description: one sentence describing what you see\n"
+                        "Respond ONLY with valid JSON, no markdown fences."
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_b64}",
+                                "detail": "low"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "What is currently on the screen? Is the video playing? Is there a dialog, ad, or error?"
+                        }
+                    ]
+                }
+            ]
+        )
+
+        raw = response.choices[0].message.content.strip()
+        # Strip markdown fences if model added them despite instructions
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        result = json.loads(raw)
+        return {
+            "status": result.get("status", "unknown"),
+            "action": result.get("action", ""),
+            "description": result.get("description", "")
+        }
+    except Exception as e:
+        return {"status": "unknown", "action": "", "description": f"Vision check failed: {e}"}
+
+
 def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval: int = 3,
-                      auto_recover: bool = True, max_recovery_attempts: int = 3) -> Dict:
+                      auto_recover: bool = True, max_recovery_attempts: int = 3,
+                      vision_check_interval: int = 60) -> Dict:
     """
     Keep browser alive and wait for specified duration.
     Useful for monitoring video playback or keeping page open.
@@ -879,9 +971,70 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
             if auto_recover:
                 print(f"   Auto-recovery enabled (max {max_recovery_attempts} attempts)\n")
 
+        # Track previous currentTime to detect stalls (video.paused=false but video frozen)
+        _prev_current_time = None
+        _last_vision_check_at = 0  # elapsed seconds at last vision check
+        _zero_currenttime_streak = 0  # consecutive failures where currentTime==0 (video never loaded)
+        _recovery_in_progress = False  # True while JS recovery is running — gates vision check
+
         while elapsed < seconds:
             # Calculate remaining time
             remaining = seconds - elapsed
+
+            # ── Dead-browser check ──────────────────────────────────────────────────
+            # If the page connection died (crash, driver restart), relaunch and resume.
+            if not _ping_page():
+                print(f"   💀 Browser connection lost at {int(elapsed)}s — attempting relaunch...")
+                try:
+                    relaunch = launch_browser(
+                        browser_type=_current_browser_type or "chromium",
+                        headless=False
+                    )
+                    if relaunch.get("success") and _last_navigated_url:
+                        nav = navigate_to_url(_last_navigated_url)
+                        if nav.get("success"):
+                            time.sleep(3)
+                            _page_instance.evaluate(f"""
+                                () => {{
+                                    const video = document.querySelector('video');
+                                    if (video) {{ video.currentTime = {int(elapsed)}; video.play(); }}
+                                    const btn = document.querySelector('.ytp-play-button') ||
+                                                document.querySelector('button[aria-label*="Play"]');
+                                    if (btn) {{ btn.click(); }}
+                                }}
+                            """)
+                            _prev_current_time = None
+                            _zero_currenttime_streak = 0
+                            consecutive_failures = 0
+                            per_event_attempt = 0
+                            _recovery_in_progress = False
+                            print(f"   ✅ Browser relaunched and resumed at {int(elapsed)}s")
+                        else:
+                            print(f"   ❌ Re-navigation failed: {nav.get('error')} — aborting wait")
+                            break
+                    else:
+                        print(f"   ❌ Browser relaunch failed — aborting wait")
+                        break
+                except Exception as relaunch_err:
+                    print(f"   ❌ Fatal relaunch error: {relaunch_err} — aborting wait")
+                    break
+
+            # Snapshot currentTime BEFORE sleeping so we can compare after
+            if verify_playing:
+                try:
+                    _prev_current_time = _page_instance.evaluate(
+                        "() => { const v = document.querySelector('video'); return v ? v.currentTime : null; }"
+                    )
+                except Exception:
+                    _prev_current_time = None
+
+            # Simulate user activity to prevent YouTube "Are you still watching?" pausing
+            try:
+                _page_instance.evaluate(
+                    "() => { document.dispatchEvent(new MouseEvent('mousemove', {bubbles: true})); }"
+                )
+            except Exception:
+                pass
 
             # Wait for check_interval or remaining time (whichever is smaller)
             sleep_time = min(check_interval, remaining)
@@ -894,38 +1047,136 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
             progress_pct = (elapsed / seconds) * 100
             print(f"⏳ [{progress_pct:5.1f}%] Elapsed: {int(elapsed)}s / {seconds}s  |  Remaining: {int(seconds - elapsed)}s")
 
+            # Periodic vision check: take a screenshot and ask GPT-4o what's on screen
+            # Skipped while a JS recovery is in progress to avoid conflicting reloads.
+            if verify_playing and auto_recover and not _recovery_in_progress and (elapsed - _last_vision_check_at) >= vision_check_interval:
+                _last_vision_check_at = elapsed
+                print(f"   📸 Vision check at {int(elapsed)}s...")
+                vision = _vision_check_screen()
+                print(f"   🔍 Vision: [{vision['status']}] {vision['description']}")
+                if vision["status"] == "error":
+                    # Vision sees an error page (e.g. 'Video unavailable') — reload immediately
+                    print(f"   🔄 Vision detected error — reloading page and seeking to {int(elapsed)}s...")
+                    try:
+                        _page_instance.reload(wait_until="domcontentloaded")
+                        time.sleep(5)
+                        _page_instance.evaluate(f"""
+                            () => {{
+                                document.querySelector('.ytp-ad-skip-button')?.click();
+                                document.querySelector('.ytp-ad-skip-button-modern')?.click();
+                                document.querySelector('.ytp-overlay-close-button')?.click();
+                                const video = document.querySelector('video');
+                                if (video) {{ video.currentTime = {int(elapsed)}; video.play(); }}
+                                const btn = document.querySelector('.ytp-play-button') ||
+                                            document.querySelector('button[aria-label*="Play"]');
+                                if (btn) {{ btn.click(); }}
+                            }}
+                        """)
+                        time.sleep(3)
+                        _prev_current_time = None  # reset so next check isn't comparing against old value
+                        _zero_currenttime_streak = 0
+                        consecutive_failures = 0
+                        per_event_attempt = 0
+                    except Exception as ve:
+                        print(f"   ⚠️  Vision-triggered reload failed: {ve}")
+                elif vision["action"]:
+                    print(f"   ⚡ Vision action: {vision['action']}")
+                    try:
+                        _page_instance.evaluate(vision["action"])
+                        time.sleep(2)
+                        # Reset failure counter — the JS action may have fixed the issue,
+                        # so don't immediately trigger a full recovery on the next check.
+                        consecutive_failures = 0
+                        per_event_attempt = 0
+                        _prev_current_time = None
+                    except Exception as ve:
+                        print(f"   ⚠️  Vision action failed: {ve}")
+
             # Verify video is still playing (if requested)
             if verify_playing and elapsed < seconds:
                 try:
-                    is_playing = _page_instance.evaluate("""
+                    # Get both paused state AND currentTime in one call
+                    play_state = _page_instance.evaluate("""
                         () => {
                             const video = document.querySelector('video');
-                            if (video) {
-                                // readyState > 2 removed: a buffering video (readyState==2)
-                                // is not paused, just waiting for data — don't falsely trigger recovery
-                                return !video.paused && !video.ended;
-                            }
-                            return false;
+                            if (!video) return { found: false };
+
+                            // Auto-dismiss "Are you still watching?" and similar dialogs
+                            const confirmBtns = document.querySelectorAll(
+                                '.ytp-confirm-dialog-confirm, ' +
+                                'button.yt-spec-button-shape-next[aria-label*="Yes"], ' +
+                                'button[aria-label*="still watching"], ' +
+                                'tp-yt-paper-dialog button.yt-spec-button-shape-next'
+                            );
+                            confirmBtns.forEach(b => b.click());
+
+                            return {
+                                found: true,
+                                paused: video.paused,
+                                ended: video.ended,
+                                currentTime: video.currentTime,
+                                readyState: video.readyState
+                            };
                         }
                     """)
 
-                    if is_playing:
-                        print(f"   ✅ Video is playing")
-                        consecutive_failures = 0
-                        per_event_attempt = 0   # reset per-event counter on success
-                    else:
+                    if not play_state.get('found'):
+                        print(f"   ⚠️  No video element found on page")
                         consecutive_failures += 1
-                        print(f"   ⚠️  Video not playing (failure #{consecutive_failures})")
+                    else:
+                        curr_time = play_state.get('currentTime', 0)
+                        is_paused = play_state.get('paused', True)
+                        is_ended = play_state.get('ended', False)
+
+                        # Detect stall: not paused but currentTime hasn't advanced
+                        time_advanced = (
+                            _prev_current_time is None or
+                            curr_time is None or
+                            (curr_time - _prev_current_time) >= (sleep_time * 0.3)
+                        )
+                        is_playing = not is_paused and not is_ended and time_advanced
+
+                        # Track consecutive failures where video is frozen at 0 (never loaded)
+                        if not is_playing and (curr_time is None or curr_time == 0.0):
+                            _zero_currenttime_streak += 1
+                        else:
+                            _zero_currenttime_streak = 0
+
+                        if not time_advanced and not is_paused and not is_ended:
+                            print(f"   ⚠️  Video stalled (currentTime stuck at {curr_time:.1f}s, not advancing)")
+                        elif is_paused:
+                            print(f"   ⚠️  Video is paused (currentTime={curr_time:.1f}s)")
+                        elif is_ended:
+                            print(f"   ✅ Video ended naturally")
+                            break
+                        else:
+                            print(f"   ✅ Video is playing (currentTime={curr_time:.1f}s, +{curr_time - (_prev_current_time or curr_time):.1f}s)")
+
+                        if is_playing:
+                            consecutive_failures = 0
+                            per_event_attempt = 0   # reset per-event counter on success
+                            _zero_currenttime_streak = 0
+                            _recovery_in_progress = False
+                        else:
+                            consecutive_failures += 1
+                            print(f"   ⚠️  Video not playing (failure #{consecutive_failures})")
 
                         # Require 2 consecutive failures before triggering recovery.
                         # A single blip (ad transition, brief buffer) must not cause a page reload.
                         if consecutive_failures < 2:
                             print(f"   ⏳ Waiting for next check before acting (may be transient)...")
                         elif auto_recover and per_event_attempt < max_recovery_attempts:
+                            _recovery_in_progress = True  # gate vision check while recovery runs
                             per_event_attempt += 1
                             total_recovery_attempts += 1
                             print(f"   🔄 Auto-recovery attempt {per_event_attempt}/{max_recovery_attempts} (total: {total_recovery_attempts})...")
                             try:
+                                # If currentTime is stuck at 0 for 2+ consecutive failures the video
+                                # was never loaded — Strategy 1 (JS play) cannot help, go straight to reload.
+                                if _zero_currenttime_streak >= 2 and per_event_attempt == 1:
+                                    print(f"   ⏩ currentTime stuck at 0 — skipping Strategy 1, going straight to reload")
+                                    per_event_attempt = 2  # force Strategy 2 branch below
+
                                 # Strategy 1 (per-event attempt 1): JS video.play() + click play button
                                 if per_event_attempt == 1:
                                     print(f"   🎯 Strategy 1: dismiss overlays + JS play() + click play button")
@@ -996,19 +1247,29 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                                     """)
                                     time.sleep(5)
 
-                                is_recovered = _page_instance.evaluate("""
-                                    () => {
-                                        const video = document.querySelector('video');
-                                        if (video) {
-                                            return !video.paused && !video.ended;
-                                        }
-                                        return false;
-                                    }
-                                """)
+                                # Verify recovery: wait 6s and confirm currentTime advances AND
+                                # is past 1.0s.  time_after > 1.0 rules out a stuck-at-zero error
+                                # page; advance >= 1.0s rules out brief buffering blips.
+                                time_before = _page_instance.evaluate(
+                                    "() => { const v = document.querySelector('video'); return v ? v.currentTime : 0; }"
+                                )
+                                time.sleep(6)
+                                time_after = _page_instance.evaluate(
+                                    "() => { const v = document.querySelector('video'); return v ? v.currentTime : 0; }"
+                                )
+                                is_recovered = (
+                                    time_after is not None and
+                                    time_before is not None and
+                                    time_after > 1.0 and                 # must be past the very start
+                                    (time_after - time_before) >= 1.0    # must advance at least 1s in 6s
+                                )
                                 if is_recovered:
-                                    print(f"   ✅ Auto-recovery successful! Video is playing again.")
+                                    print(f"   ✅ Auto-recovery successful! Video is playing (currentTime {time_before:.1f}s → {time_after:.1f}s).")
                                     consecutive_failures = 0
                                     per_event_attempt = 0   # reset so next stall starts from Strategy 1
+                                    _zero_currenttime_streak = 0
+                                    _recovery_in_progress = False
+                                    _prev_current_time = time_after
                                 else:
                                     print(f"   ❌ Recovery attempt {per_event_attempt} failed.")
                                     if per_event_attempt >= max_recovery_attempts:

@@ -2,6 +2,7 @@ from keys.projects_api_keys import open_ai_api_key
 from prompts.system_prompts import main_system_prompt
 from prompts.user_prompts import inital_orchestrator_prompt
 from openai import OpenAI
+import atexit
 import json
 import time
 import vpn_tools
@@ -14,6 +15,16 @@ from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_respo
 
 
 main_client = OpenAI(api_key=open_ai_api_key)
+
+# Ensure browser is always closed when the process exits, even on crash
+@atexit.register
+def _cleanup_browser():
+    try:
+        import playwright_tools
+        if playwright_tools._browser_instance:
+            playwright_tools.close_browser(force=True)
+    except Exception:
+        pass
 
 # Define agent tools for the main orchestrator LLM
 agent_tools = [
@@ -114,14 +125,42 @@ def main():
                             # Execute the agent
                             agent_result = available_agents[agent_name](**agent_args)
                             execution_time = time.time() - start_time
-                            
+
                             log_tool_call_result(agent_name, agent_result, execution_time)
-                            
+
                             print(f"\n✅ Agent '{agent_name}' completed in {execution_time:.2f}s")
                             print(f"   Success: {agent_result.get('success', False)}")
                             print(f"   VPN Connected: {agent_result.get('vpn_connected', False)}")
                             print(f"   VPN Disconnected: {agent_result.get('vpn_disconnected', False)}\n")
-                            
+
+                            # Cascading failure guard: block browser agent if VPN failed OR
+                            # if traffic is not confirmed to route through VPN (ip not changed).
+                            vpn_success = agent_result.get('success', False)
+                            vpn_ip_verified = agent_result.get('vpn_ip_verified', False)
+                            if agent_name == "call_vpn_agent" and not (vpn_success and vpn_ip_verified):
+                                if not vpn_success:
+                                    block_reason = "VPN agent reported failure"
+                                else:
+                                    block_reason = "VPN connected but IP did not change — traffic may not be routed through VPN"
+                                print(f"   ❌ Blocking browser agent: {block_reason}")
+                                messages.append({
+                                    "tool_call_id": tool_call.id,
+                                    "role": "tool",
+                                    "name": agent_name,
+                                    "content": json.dumps(agent_result)
+                                })
+                                # Inject an explicit instruction so the orchestrator knows to abort/retry VPN
+                                messages.append({
+                                    "role": "user",
+                                    "content": (
+                                        f"❌ VPN guard blocked: {block_reason}. "
+                                        "Do NOT call the browser agent until VPN is successfully connected "
+                                        "AND the public IP is confirmed changed. "
+                                        "Either retry with a different server or report failure."
+                                    )
+                                })
+                                break  # stop processing further tool_calls in this batch
+
                             # Add agent result to messages
                             messages.append({
                                 "tool_call_id": tool_call.id,
