@@ -1,12 +1,28 @@
 from keys.projects_api_keys import open_ai_api_key, MULLVAD_ACCOUNT
 from prompts.system_prompts import vpn_prompt
 from openai import OpenAI
+import builtins as _builtins
+import logging as _logging
 import json
 import time
 import urllib.request
 import vpn_tools
 from logger.logger_file import (log_user_request, log_gpt_request, log_gpt_response, log_tool_call_start,
-    log_tool_call_result, log_final_response, log_error, log_session_summary)
+    log_tool_call_result, log_final_response, log_error, log_session_summary,
+    llm_logger as _file_logger)
+
+_orig_print = _builtins.print
+
+def _p(*args, sep=' ', end='\n', file=None, flush=False):
+    _orig_print(*args, sep=sep, end=end, file=file, flush=flush)
+    if file is None:
+        msg = sep.join(str(a) for a in args)
+        try:
+            _file_logger._safe_log(_logging.DEBUG, msg)
+        except Exception:
+            pass
+
+print = _p
 
 llm_vpn_client = OpenAI(api_key=open_ai_api_key)
 

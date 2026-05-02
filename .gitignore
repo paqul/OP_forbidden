@@ -200,3 +200,4 @@ vpns/vpn_config.py
 
 # WireGuard VPN Configurations (may contain private keys)
 *.conf
+/screenshots/*.png

@@ -39,7 +39,7 @@ class LLMLogger:
     Automatically redacts API keys and account numbers from all output.
     """
 
-    def __init__(self, log_dir: str = "logs", log_level: int = logging.INFO):
+    def __init__(self, log_dir: str = "logs", log_level: int = logging.DEBUG):
         """
         Initialize the LLM Logger.
 
@@ -55,7 +55,9 @@ class LLMLogger:
 
         # Create logger instance
         self.logger = logging.getLogger('LLMExecution')
-        self.logger.setLevel(log_level)
+        # Set root level to DEBUG so DEBUG messages reach the file handler.
+        # The console handler has its own level (INFO) and filters independently.
+        self.logger.setLevel(logging.DEBUG)
 
         # Prevent duplicate handlers
         if self.logger.handlers:

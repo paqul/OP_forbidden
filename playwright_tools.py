@@ -3,11 +3,30 @@ import json
 import asyncio
 import time
 import base64
+import builtins as _builtins
+import logging as _logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from playwright.sync_api import sync_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 from openai import OpenAI
 from keys.projects_api_keys import open_ai_api_key
+from logger.logger_file import llm_logger as _file_logger
+
+# Shadow the built-in print so every print() call in this module is also
+# written to the log file at DEBUG level.  The console handler only emits
+# INFO+, so there is no duplicate console output.
+_orig_print = _builtins.print
+
+def _p(*args, sep=' ', end='\n', file=None, flush=False):
+    _orig_print(*args, sep=sep, end=end, file=file, flush=flush)
+    if file is None:
+        msg = sep.join(str(a) for a in args)
+        try:
+            _file_logger._safe_log(_logging.DEBUG, msg)
+        except Exception:
+            pass
+
+print = _p  # all print() in this module now also log to file
 
 _vision_client = OpenAI(api_key=open_ai_api_key)
 
@@ -395,6 +414,33 @@ def _ping_page() -> bool:
         return False
 
 
+def _wait_for_spinner_gone(timeout_s: int = 20) -> bool:
+    """
+    Poll until the YouTube buffering/loading spinner has disappeared AND the
+    page is at least interactive.  Returns True when clear, False if still
+    spinning after timeout_s seconds.
+    Safe to call even before the video element fully exists.
+    """
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        try:
+            still_loading = _page_instance.evaluate("""
+                () => {
+                    if (document.readyState === 'loading') return true;
+                    const spinner = document.querySelector('.ytp-spinner');
+                    if (!spinner) return false;
+                    const s = window.getComputedStyle(spinner);
+                    return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0';
+                }
+            """)
+            if not still_loading:
+                return True
+        except Exception:
+            break  # page likely dead — caller handles it
+        time.sleep(0.5)
+    return False
+
+
 def launch_browser(browser_type: str = "chromium", headless: bool = False,
                    viewport_width: int = 1920, viewport_height: int = 1080) -> Dict:
     """
@@ -428,11 +474,35 @@ def launch_browser(browser_type: str = "chromium", headless: bool = False,
             }
         
         # Launch browser
-        _browser_instance = browser.launch(headless=headless)
+        # For chromium: use channel="chrome" to launch the REAL system Google Chrome
+        # instead of Playwright's bundled Chromium.  The bundled Chromium has no Widevine
+        # CDM, so YouTube DRM fails after the initial ~27s pre-buffered segment runs out.
+        # Real Chrome ships with Widevine and can play YouTube without the
+        # "Something went wrong" error.
+        if browser_type == "chromium":
+            _browser_instance = browser.launch(
+                headless=headless,
+                channel="chrome",        # ← use real Chrome with Widevine
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-infobars",
+                ]
+            )
+        else:
+            _browser_instance = browser.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-first-run",
+                ]
+            )
         _current_browser_type = browser_type
         
-        # User agent to appear as real browser (helps avoid bot detection)
-        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        # User agent — match a recent Chrome stable release to avoid bot-detection
+        # heuristics that flag outdated UA strings.
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         
         # Create browser context with viewport and NO STATE (fresh start - no cookies, no cache)
         _context_instance = _browser_instance.new_context(
@@ -448,7 +518,13 @@ def launch_browser(browser_type: str = "chromium", headless: bool = False,
         
         # Clear all cookies and storage (double ensure clean state)
         _context_instance.clear_cookies()
-        
+
+        # Hide automation fingerprint — navigator.webdriver = true is a strong
+        # signal YouTube uses to detect bots and restrict playback.
+        _context_instance.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+
         # Create new page
         _page_instance = _context_instance.new_page()
         
@@ -902,9 +978,11 @@ def _vision_check_screen() -> Dict:
                     "content": (
                         "You are a browser automation assistant monitoring a YouTube video. "
                         "Analyze the screenshot and return a JSON object with exactly these fields:\n"
-                        "  status: one of 'playing', 'paused', 'ad', 'dialog', 'error', 'unknown'\n"
+                        "  status: one of 'playing', 'paused', 'ad', 'dialog', 'error', 'bot_detection', 'unknown'\n"
                         "  action: a single-line JavaScript snippet to fix the problem (empty string if none needed)\n"
                         "  description: one sentence describing what you see\n"
+                        "Use 'bot_detection' when the page shows 'Sign in to confirm you're not a bot', "
+                        "a captcha, or any other anti-bot/human-verification challenge. "
                         "Respond ONLY with valid JSON, no markdown fences."
                     )
                 },
@@ -1054,7 +1132,20 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                 print(f"   📸 Vision check at {int(elapsed)}s...")
                 vision = _vision_check_screen()
                 print(f"   🔍 Vision: [{vision['status']}] {vision['description']}")
-                if vision["status"] == "error":
+                if vision["status"] == "bot_detection":
+                    # YouTube is demanding human verification — no JS trick can bypass this.
+                    # Signal the orchestrator to swap VPN server and retry.
+                    print(f"   🚨 Vision detected bot-detection challenge — VPN IP is flagged!")
+                    return {
+                        "success": False,
+                        "error": "Bot detection challenge appeared during playback",
+                        "error_type": "BOT_DETECTION",
+                        "vpn_swap_required": True,
+                        "elapsed_seconds": int(elapsed),
+                        "remaining_seconds": int(remaining),
+                        "recommendation": "Ask VPN agent to switch to a different server (prefer residential ISP), then re-navigate and restart playback.",
+                    }
+                elif vision["status"] == "error":
                     # Vision sees an error page (e.g. 'Video unavailable') — reload immediately
                     print(f"   🔄 Vision detected error — reloading page and seeking to {int(elapsed)}s...")
                     try:
@@ -1095,7 +1186,10 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
             # Verify video is still playing (if requested)
             if verify_playing and elapsed < seconds:
                 try:
-                    # Get both paused state AND currentTime in one call
+                    # Get video state, currentTime, AND play/pause button label in one call.
+                    # The button's aria-label is the ground-truth indicator visible in the UI:
+                    #   aria-label contains "Pause"  → video IS playing  (button offers to pause)
+                    #   aria-label contains "Play"   → video IS stopped  (button offers to play)
                     play_state = _page_instance.evaluate("""
                         () => {
                             const video = document.querySelector('video');
@@ -1110,12 +1204,19 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                             );
                             confirmBtns.forEach(b => b.click());
 
+                            // Read play/pause button label
+                            const btn = document.querySelector('.ytp-play-button') ||
+                                        document.querySelector('button[aria-label*="Play"]') ||
+                                        document.querySelector('button[aria-label*="Pause"]');
+                            const btnLabel = btn ? (btn.getAttribute('aria-label') || '').toLowerCase() : '';
+
                             return {
                                 found: true,
                                 paused: video.paused,
                                 ended: video.ended,
                                 currentTime: video.currentTime,
-                                readyState: video.readyState
+                                readyState: video.readyState,
+                                btnLabel: btnLabel
                             };
                         }
                     """)
@@ -1127,6 +1228,31 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                         curr_time = play_state.get('currentTime', 0)
                         is_paused = play_state.get('paused', True)
                         is_ended = play_state.get('ended', False)
+                        btn_label = play_state.get('btnLabel', '')
+
+                        # Button-based override: if the UI button says "pause" the video IS playing
+                        # regardless of what video.paused reports (race conditions during buffering).
+                        # If the button says "play" the video is definitely stopped — click it now
+                        # before running heavier recovery strategies.
+                        btn_says_playing = 'pause' in btn_label
+                        btn_says_stopped = 'play' in btn_label and 'pause' not in btn_label
+
+                        # If the UI button says "play", the video is definitely stopped — click
+                        # it immediately (soft recovery) before any heavier strategy fires.
+                        if btn_says_stopped and not is_ended:
+                            print(f"   🔘 Button shows 'Play' — video stopped, clicking play button immediately")
+                            try:
+                                _page_instance.evaluate("""
+                                    () => {
+                                        const btn = document.querySelector('.ytp-play-button') ||
+                                                    document.querySelector('button[aria-label*="Play"]');
+                                        if (btn) btn.click();
+                                        const video = document.querySelector('video');
+                                        if (video && video.paused) video.play();
+                                    }
+                                """)
+                            except Exception:
+                                pass
 
                         # Detect stall: not paused but currentTime hasn't advanced
                         time_advanced = (
@@ -1134,7 +1260,17 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                             curr_time is None or
                             (curr_time - _prev_current_time) >= (sleep_time * 0.3)
                         )
-                        is_playing = not is_paused and not is_ended and time_advanced
+
+                        # Determine is_playing with strict priority:
+                        #   1. If the UI button label is available → use it together with time_advanced.
+                        #      "pause" in label AND time advancing → IS playing (healthy).
+                        #      "pause" in label BUT time NOT advancing → stalled/frozen (treat as NOT playing).
+                        #      "play"  in label → NOT playing regardless of time (video stopped).
+                        #   2. No button found → fall back to video.paused + time progression.
+                        if btn_label:
+                            is_playing = btn_says_playing and time_advanced and not is_ended
+                        else:
+                            is_playing = not is_paused and not is_ended and time_advanced
 
                         # Track consecutive failures where video is frozen at 0 (never loaded)
                         if not is_playing and (curr_time is None or curr_time == 0.0):
@@ -1142,15 +1278,17 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                         else:
                             _zero_currenttime_streak = 0
 
-                        if not time_advanced and not is_paused and not is_ended:
-                            print(f"   ⚠️  Video stalled (currentTime stuck at {curr_time:.1f}s, not advancing)")
-                        elif is_paused:
-                            print(f"   ⚠️  Video is paused (currentTime={curr_time:.1f}s)")
-                        elif is_ended:
+                        if is_ended:
                             print(f"   ✅ Video ended naturally")
                             break
+                        elif is_playing:
+                            print(f"   ✅ Video is playing (currentTime={curr_time:.1f}s, +{curr_time - (_prev_current_time or curr_time):.1f}s, btn='{btn_label}')")
+                        elif btn_says_stopped:
+                            print(f"   ⚠️  Button shows 'Play' — video is stopped (currentTime={curr_time:.1f}s)")
+                        elif not time_advanced and not is_paused:
+                            print(f"   ⚠️  Video stalled (currentTime stuck at {curr_time:.1f}s, not advancing, btn='{btn_label}')")
                         else:
-                            print(f"   ✅ Video is playing (currentTime={curr_time:.1f}s, +{curr_time - (_prev_current_time or curr_time):.1f}s)")
+                            print(f"   ⚠️  Video is paused (currentTime={curr_time:.1f}s, btn='{btn_label}')")
 
                         if is_playing:
                             consecutive_failures = 0
@@ -1159,7 +1297,19 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                             _recovery_in_progress = False
                         else:
                             consecutive_failures += 1
-                            print(f"   ⚠️  Video not playing (failure #{consecutive_failures})")
+                            print(f"   ⚠️  Video not playing (failure #{consecutive_failures}, btn='{btn_label}')")
+                            # Take a diagnostic screenshot on first failure so the next vision check
+                            # and log have a visual record of what was on screen when it stopped.
+                            if consecutive_failures == 1:
+                                try:
+                                    _ss_name = f"not_playing_{int(elapsed)}s.png"
+                                    _page_instance.screenshot(
+                                        path=str(SCREENSHOTS_DIR / _ss_name),
+                                        type="png"
+                                    )
+                                    print(f"   📸 Diagnostic screenshot saved: screenshots/{_ss_name}")
+                                except Exception:
+                                    pass
 
                         # Require 2 consecutive failures before triggering recovery.
                         # A single blip (ad transition, brief buffer) must not cause a page reload.
@@ -1197,13 +1347,21 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                                             if (playBtn) { playBtn.click(); }
                                         }
                                     """)
-                                    time.sleep(3)
+                                    time.sleep(2)
+                                    # Wait for buffering spinner to clear before verifying recovery
+                                    if not _wait_for_spinner_gone(timeout_s=10):
+                                        print(f"   ⚠️  Spinner still visible after 10s — video may still be buffering")
 
                                 # Strategy 2 (per-event attempt 2): Reload page, seek to elapsed time, click play
                                 elif per_event_attempt == 2:
                                     print(f"   🎯 Strategy 2: Reload page + dismiss overlays + seek to {int(elapsed)}s + click play")
                                     _page_instance.reload(wait_until="domcontentloaded")
-                                    time.sleep(5)
+                                    time.sleep(3)
+                                    # Wait for page to finish loading before seeking — avoids clicking play
+                                    # while the browser's loading indicator is still active
+                                    print(f"   ⏳ Waiting for page to finish loading before seeking...")
+                                    if not _wait_for_spinner_gone(timeout_s=20):
+                                        print(f"   ⚠️  Page still loading after 20s — proceeding anyway")
                                     # Dismiss any overlays after reload, seek to elapsed position
                                     _page_instance.evaluate(f"""
                                         () => {{
@@ -1223,13 +1381,18 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                                             if (playBtn) {{ playBtn.click(); }}
                                         }}
                                     """)
-                                    time.sleep(5)
+                                    time.sleep(2)
 
                                 # Strategy 3 (per-event attempt 3): Full reload, no seek, dismiss overlays, click play
                                 else:
                                     print(f"   🎯 Strategy 3: Full page reload + dismiss overlays + click play (last resort)")
                                     _page_instance.reload(wait_until="load")
-                                    time.sleep(8)
+                                    time.sleep(2)
+                                    # wait_until="load" already fires after DOM is ready; still wait
+                                    # for the YouTube player spinner to disappear before clicking play
+                                    print(f"   ⏳ Waiting for YouTube player to finish loading...")
+                                    if not _wait_for_spinner_gone(timeout_s=25):
+                                        print(f"   ⚠️  Player still loading after 25s — proceeding anyway")
                                     _page_instance.evaluate("""
                                         () => {
                                             document.querySelector('.ytp-ad-skip-button')?.click();
@@ -1245,11 +1408,16 @@ def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval:
                                             if (playBtn) { playBtn.click(); }
                                         }
                                     """)
-                                    time.sleep(5)
+                                    time.sleep(2)
 
-                                # Verify recovery: wait 6s and confirm currentTime advances AND
-                                # is past 1.0s.  time_after > 1.0 rules out a stuck-at-zero error
-                                # page; advance >= 1.0s rules out brief buffering blips.
+                                # Verify recovery: wait for any buffering spinner to clear first,
+                                # then confirm currentTime advances over 6s.  time_after > 1.0 rules
+                                # out a stuck-at-zero error; advance >= 1.0s rules out blips.
+                                # Without this check, a buffering video registers as "not recovered"
+                                # even though play was clicked successfully.
+                                if not _wait_for_spinner_gone(timeout_s=12):
+                                    print(f"   ⚠️  Spinner visible at verification start — video still buffering, extra 5s wait")
+                                    time.sleep(5)
                                 time_before = _page_instance.evaluate(
                                     "() => { const v = document.querySelector('video'); return v ? v.currentTime : 0; }"
                                 )

@@ -397,12 +397,14 @@ def get_wireguard_status() -> Dict:
 def list_vpn_servers(region: str = "all") -> Dict:
     """
     Get REAL VPN servers from Mullvad API (free, no auth required)
-    Returns JSON with server details
+    Returns JSON with server details (capped at 40 results to keep LLM context manageable)
     """
     try:
         response = requests.get('https://api.mullvad.net/www/relays/all/', timeout=10)
         all_servers = response.json()
         servers = [s for s in all_servers if s.get('type') == 'wireguard' and s.get('active')]
+
+        # Named region aliases → list of country codes
         region_map = {
             "us-east": ["us"],
             "us-west": ["us"],
@@ -410,9 +412,20 @@ def list_vpn_servers(region: str = "all") -> Dict:
             "eu-central": ["de", "ch", "at"],
             "asia-pacific": ["jp", "sg", "au", "hk"]
         }
-        if region != "all" and region in region_map:
-            countries = region_map[region]
-            servers = [s for s in servers if s.get('country_code') in countries]
+
+        if region != "all":
+            if region in region_map:
+                # Named alias
+                countries = region_map[region]
+                servers = [s for s in servers if s.get('country_code') in countries]
+            else:
+                # Treat as a direct ISO country code (e.g. "de", "nl", "se", "us")
+                servers = [s for s in servers if s.get('country_code') == region.lower()]
+
+        # Cap at 40 servers — returning 500+ entries overwhelms the LLM context and
+        # causes it to hallucinate server IDs instead of picking from the real list.
+        servers = servers[:40]
+
         result_servers = []
         for server in servers:
             result_servers.append({
@@ -425,6 +438,16 @@ def list_vpn_servers(region: str = "all") -> Dict:
                 "ip": server['ipv4_addr_in'],
                 "provider": server.get('provider', 'Unknown')
             })
+
+        if not result_servers and region != "all":
+            return {
+                "success": False,
+                "error": f"No servers found for region '{region}'. Try a different country code or region alias.",
+                "available_aliases": list(region_map.keys()),
+                "hint": "Use ISO country codes like 'de', 'nl', 'se', 'us', 'gb', or aliases above.",
+                "servers": []
+            }
+
         return {
             "success": True,
             "count": len(result_servers),
