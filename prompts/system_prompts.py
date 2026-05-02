@@ -81,6 +81,15 @@ When asked to list/find servers:
 - Use list_vpn_servers(region="...") to get available servers
 - Use get_vpn_server_status(server_id="...") for specific server details
 
+SERVER SELECTION PROCEDURE — ALWAYS follow this order when picking a server to connect to:
+1. Call get_server_usage_stats() FIRST — this returns every server ranked by how many times it has been connected to
+2. Call list_vpn_servers(region="...") to get the current live server list for the desired region
+3. Cross-reference: from the live list, pick the server with the LOWEST connection_count in the usage stats
+   - Prefer count=0 (never used) above all others
+   - If multiple never-used servers exist, pick any one
+   - If all have been used, pick the one with the fewest connections and oldest last_used timestamp
+4. Never pick a server you just disconnected from in the same session unless there is no alternative
+
 CRITICAL: 
 - ALWAYS include mullvad_account parameter when calling connect_to_vpn()
 - Never use test_mode (always production authenticated connections)

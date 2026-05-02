@@ -14,6 +14,7 @@ WG_PATH = r"C:\Program Files\WireGuard\wg.exe"
 WG_GUI_PATH = r"C:\Program Files\WireGuard\wireguard.exe"
 WG_CONFIG_DIR = Path.home() / "AppData" / "Local" / "WireGuard" / "Configurations"
 WG_KEYS_STORAGE = Path.home() / "AppData" / "Local" / "WireGuard" / "mullvad_keys.json"
+VPN_USAGE_STORAGE = Path.home() / "AppData" / "Local" / "WireGuard" / "vpn_usage_stats.json"
 
 # Ensure config directory exists
 WG_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -113,6 +114,18 @@ tools = [
                 "required": []
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_server_usage_stats",
+            "description": "Get statistics on how many times each VPN server has been connected to during this and previous sessions. ALWAYS call this BEFORE list_vpn_servers when selecting a server to connect to. Returns a ranked list with connection counts and last-used timestamps so you can pick the least-used or never-used server. Servers with count=0 have never been tried.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
     }
 ]
 
@@ -127,6 +140,88 @@ def _load_stored_keys() -> Dict:
     except Exception as e:
         print(f"Warning: Could not load stored keys: {str(e)}")
         return {}
+
+
+# ---------------------------------------------------------------------------
+# VPN Usage Tracking
+# ---------------------------------------------------------------------------
+
+def _load_usage_stats() -> Dict:
+    """Load persisted server usage stats from disk."""
+    try:
+        if VPN_USAGE_STORAGE.exists():
+            with open(VPN_USAGE_STORAGE, 'r') as f:
+                return json.load(f)
+    except Exception:
+        pass
+    return {}
+
+
+def _save_usage_stats(stats: Dict):
+    """Persist server usage stats to disk."""
+    try:
+        with open(VPN_USAGE_STORAGE, 'w') as f:
+            json.dump(stats, f, indent=2)
+    except Exception as e:
+        print(f"Warning: Could not save usage stats: {str(e)}")
+
+
+def _record_connection(server_id: str):
+    """Increment connection count for a server and update last-used timestamp."""
+    stats = _load_usage_stats()
+    entry = stats.get(server_id, {"count": 0, "last_used": None})
+    entry["count"] += 1
+    entry["last_used"] = time.strftime('%Y-%m-%d %H:%M:%S')
+    stats[server_id] = entry
+    _save_usage_stats(stats)
+    print(f"   📊 Usage recorded: {server_id} (total connections: {entry['count']})")
+
+
+def get_server_usage_stats() -> Dict:
+    """
+    Return connection count and last-used timestamp for every server ever connected to.
+    Also cross-references the live Mullvad server list to show never-used servers.
+    Results are sorted: never-used first, then by ascending connection count.
+    """
+    stats = _load_usage_stats()
+
+    # Fetch current live server list so we can show never-used ones too
+    try:
+        response = requests.get('https://api.mullvad.net/www/relays/all/', timeout=10)
+        all_servers = response.json()
+        live_ids = {
+            s['hostname'] for s in all_servers
+            if s.get('type') == 'wireguard' and s.get('active')
+        }
+    except Exception:
+        live_ids = set()
+
+    # Build combined list
+    all_ids = live_ids | set(stats.keys())
+    rows = []
+    for sid in all_ids:
+        entry = stats.get(sid, {"count": 0, "last_used": None})
+        rows.append({
+            "server_id": sid,
+            "connection_count": entry["count"],
+            "last_used": entry["last_used"],
+            "still_available": sid in live_ids,
+        })
+
+    # Sort: never-used (count=0) first, then fewest connections, then oldest last-used
+    rows.sort(key=lambda r: (r["connection_count"], r["last_used"] or ""))
+
+    total_connections = sum(r["connection_count"] for r in rows)
+    never_used = sum(1 for r in rows if r["connection_count"] == 0)
+
+    return {
+        "success": True,
+        "total_servers_tracked": len(rows),
+        "never_used_count": never_used,
+        "total_connections_recorded": total_connections,
+        "recommendation": "Prefer servers with connection_count=0 (never used) or the lowest count.",
+        "servers": rows,
+    }
 
 
 def _save_stored_keys(keys_data: Dict):
@@ -648,7 +743,10 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
             "authentication": auth_msg,
             "warning": warning
         }
-        
+
+        # Record usage regardless of test_mode so stats stay accurate
+        _record_connection(server_id)
+
         return {
             "success": True,
             "message": f"Connected to {server_id}",
