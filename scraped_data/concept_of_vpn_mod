@@ -1,0 +1,24 @@
+Short answer: No, not without significant changes. The VPN is a hard blocker.
+
+Here's why:
+
+Browser side — fine ✅
+Each main.py runs as a separate Python process with its own memory. The global _browser_instance / _page_instance singletons don't leak between processes, so two separate Chrome windows would work independently.
+
+VPN side — hard blocker ❌
+
+WireGuard on Windows creates a kernel-level virtual network adapter — it's a machine-wide resource, not a per-process one:
+
+One tunnel = one exit IP for the entire machine. Whichever instance last called connect_to_vpn sets the active server. The other instance's browser traffic automatically routes through the same server whether it wants to or not.
+
+Config file race condition. Both instances write to the same mullvad_keys.json and the same WireGuard\Configurations\ directory simultaneously — they'll corrupt each other's configs.
+
+Mullvad account key limit. Each connection registers a WireGuard keypair against your account. Two simultaneous connections need two registered keys, and the current code manages a single key pool.
+
+What would be needed to make it work:
+
+Problem	Solution
+Single OS network stack	Run each instance in a separate VM or Docker container (with --network isolation), or use a SOCKS5 proxy per instance instead of a system-wide tunnel
+Config file conflicts	Give each instance its own WireGuard interface name (e.g., MullvadVPN_1, MullvadVPN_2) and separate config dirs
+Key management	Register 2 keys simultaneously against the Mullvad account
+The cleanest approach for true parallel operation is separate VMs or Docker containers — each gets its own network stack and runs main.py normally. On Windows this means WSL2 instances or Hyper-V VMs.

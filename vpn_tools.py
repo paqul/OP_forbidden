@@ -44,7 +44,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_vpn_server_status",
-            "description": "Get detailed status information about a specific VPN server from Mullvad network. Use server_id from list_vpn_servers response (e.g., 'us-nyc-wg-801'). Returns JSON with server details, location, IP address, provider, and network specs.",
+            "description": "Get detailed information about a specific VPN server (IP, provider, network specs). NOTE: list_vpn_servers already returns status='online' for all results — do NOT call this for every server just to check if it's online. Only use this when you need the specific IPv4/IPv6 address or other details not provided by list_vpn_servers.",
             "parameters": {
                 "type": "object",
                 "properties": {
