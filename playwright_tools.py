@@ -315,7 +315,7 @@ tools = [
                     },
                     "check_interval": {
                         "type": "integer",
-                        "description": "Seconds between status checks (default: 3)"
+                        "description": "Seconds between status checks (default: 10)"
                     },
                     "auto_recover": {
                         "type": "boolean",
@@ -1021,7 +1021,7 @@ def _vision_check_screen() -> Dict:
         return {"status": "unknown", "action": "", "description": f"Vision check failed: {e}"}
 
 
-def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval: int = 3,
+def wait_for_duration(seconds: int, verify_playing: bool = True, check_interval: int = 10,
                       auto_recover: bool = True, max_recovery_attempts: int = 3,
                       vision_check_interval: int = 60) -> Dict:
     """

@@ -14,7 +14,8 @@ WG_PATH = r"C:\Program Files\WireGuard\wg.exe"
 WG_GUI_PATH = r"C:\Program Files\WireGuard\wireguard.exe"
 WG_CONFIG_DIR = Path.home() / "AppData" / "Local" / "WireGuard" / "Configurations"
 WG_KEYS_STORAGE = Path.home() / "AppData" / "Local" / "WireGuard" / "mullvad_keys.json"
-VPN_USAGE_STORAGE = Path.home() / "AppData" / "Local" / "WireGuard" / "vpn_usage_stats.json"
+LOGS_DIR = Path(__file__).parent / "logs"
+SERVER_USAGE_FILE = Path(__file__).parent / "logs" / "server_usage.json"
 
 # Ensure config directory exists
 WG_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -31,8 +32,8 @@ tools = [
                 "properties": {
                     "region": {
                         "type": "string",
-                        "description": "Filter servers by geographic region. Options: 'us-east' or 'us-west' for USA, 'eu-west' for UK/Netherlands/Germany/France, 'eu-central' for Germany/Switzerland/Austria, 'asia-pacific' for Japan/Singapore/Australia/Hong Kong, or 'all' for worldwide servers (default: 'all')",
-                        "enum": ["us-east", "us-west", "eu-west", "eu-central", "asia-pacific", "all"]
+                        "description": "Filter servers by geographic region. Options: 'us-east' or 'us-west' for USA, 'eu-west' for UK/Netherlands/France/Poland, 'eu-central' for Germany/Switzerland/Austria, 'asia-pacific' for Japan/Singapore/Australia/Hong Kong, 'africa' for South Africa/Nigeria/Kenya/Egypt, 'south-america' for Brazil/Argentina/Chile, 'middle-east' for UAE/Israel/Turkey, or ISO country code (e.g. 'de', 'nl', 'se'), or 'all' for worldwide (default: 'all')",
+                        "enum": ["us-east", "us-west", "eu-west", "eu-central", "asia-pacific", "africa", "south-america", "middle-east", "all"]
                     }
                 },
                 "required": []
@@ -119,7 +120,7 @@ tools = [
         "type": "function",
         "function": {
             "name": "get_server_usage_stats",
-            "description": "Get statistics on how many times each VPN server has been connected to during this and previous sessions. ALWAYS call this BEFORE list_vpn_servers when selecting a server to connect to. Returns a ranked list with connection counts and last-used timestamps so you can pick the least-used or never-used server. Servers with count=0 have never been tried.",
+            "description": "Returns only servers that have been connected to before (parsed from log files), sorted by most-used first. Use this BEFORE list_vpn_servers to get the 'avoid list'. Any server NOT in this response has never been used — prefer those. Never-used servers are NOT listed to keep the response compact.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -143,84 +144,80 @@ def _load_stored_keys() -> Dict:
 
 
 # ---------------------------------------------------------------------------
-# VPN Usage Tracking
+# VPN Usage Tracking — parsed from logs/*.log files
 # ---------------------------------------------------------------------------
-
-def _load_usage_stats() -> Dict:
-    """Load persisted server usage stats from disk."""
-    try:
-        if VPN_USAGE_STORAGE.exists():
-            with open(VPN_USAGE_STORAGE, 'r') as f:
-                return json.load(f)
-    except Exception:
-        pass
-    return {}
-
-
-def _save_usage_stats(stats: Dict):
-    """Persist server usage stats to disk."""
-    try:
-        with open(VPN_USAGE_STORAGE, 'w') as f:
-            json.dump(stats, f, indent=2)
-    except Exception as e:
-        print(f"Warning: Could not save usage stats: {str(e)}")
-
-
-def _record_connection(server_id: str):
-    """Increment connection count for a server and update last-used timestamp."""
-    stats = _load_usage_stats()
-    entry = stats.get(server_id, {"count": 0, "last_used": None})
-    entry["count"] += 1
-    entry["last_used"] = time.strftime('%Y-%m-%d %H:%M:%S')
-    stats[server_id] = entry
-    _save_usage_stats(stats)
-    print(f"   📊 Usage recorded: {server_id} (total connections: {entry['count']})")
-
 
 def get_server_usage_stats() -> Dict:
     """
-    Return connection count and last-used timestamp for every server ever connected to.
-    Also cross-references the live Mullvad server list to show never-used servers.
-    Results are sorted: never-used first, then by ascending connection count.
+    Return only servers that have been connected to at least once.
+    Primary source: logs/server_usage.json (persistent, survives log rotation).
+    Fallback: scan *.log files (covers connections made before this tracking was added).
+    Merged result is sorted most-used first.
+    Never-used servers are NOT listed — any server absent from this list is safe to use.
     """
-    stats = _load_usage_stats()
+    import re
 
-    # Fetch current live server list so we can show never-used ones too
-    try:
-        response = requests.get('https://api.mullvad.net/www/relays/all/', timeout=10)
-        all_servers = response.json()
-        live_ids = {
-            s['hostname'] for s in all_servers
-            if s.get('type') == 'wireguard' and s.get('active')
+    # --- Primary source: server_usage.json ---
+    stats: Dict = {}  # server_id -> {count, last_used}
+    if SERVER_USAGE_FILE.exists():
+        try:
+            with open(SERVER_USAGE_FILE, 'r', encoding='utf-8') as f:
+                raw = json.load(f)
+            for sid, entry in raw.items():
+                stats[sid] = {
+                    'count': entry.get('count', 0),
+                    'last_used': entry.get('last_used'),
+                    'first_used': entry.get('first_used'),
+                }
+        except Exception:
+            pass
+
+    # --- Fallback: scan log files for connections not yet in the JSON ---
+    _PATTERN = re.compile(
+        r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})'
+        r".*?Executing: connect_to_vpn\(\{.*?'server_id':\s*'([^']+)'"
+    )
+    if LOGS_DIR.exists():
+        for log_file in sorted(LOGS_DIR.glob('*.log')):
+            try:
+                with open(log_file, 'r', encoding='utf-8', errors='replace') as f:
+                    for line in f:
+                        m = _PATTERN.search(line)
+                        if m:
+                            ts, sid = m.group(1), m.group(2)
+                            if sid not in stats:
+                                # Only add entries NOT already captured in the JSON
+                                stats[sid] = {'count': 0, 'last_used': None, 'first_used': None}
+                                stats[sid]['count'] += 1
+                                stats[sid]['last_used'] = ts
+                                if stats[sid]['first_used'] is None:
+                                    stats[sid]['first_used'] = ts
+            except Exception:
+                continue
+
+    used = [
+        {
+            'server_id': sid,
+            'connection_count': entry['count'],
+            'last_used': entry['last_used'],
+            'first_used': entry.get('first_used'),
         }
-    except Exception:
-        live_ids = set()
-
-    # Build combined list
-    all_ids = live_ids | set(stats.keys())
-    rows = []
-    for sid in all_ids:
-        entry = stats.get(sid, {"count": 0, "last_used": None})
-        rows.append({
-            "server_id": sid,
-            "connection_count": entry["count"],
-            "last_used": entry["last_used"],
-            "still_available": sid in live_ids,
-        })
-
-    # Sort: never-used (count=0) first, then fewest connections, then oldest last-used
-    rows.sort(key=lambda r: (r["connection_count"], r["last_used"] or ""))
-
-    total_connections = sum(r["connection_count"] for r in rows)
-    never_used = sum(1 for r in rows if r["connection_count"] == 0)
+        for sid, entry in stats.items()
+    ]
+    used.sort(key=lambda r: -r['connection_count'])
 
     return {
-        "success": True,
-        "total_servers_tracked": len(rows),
-        "never_used_count": never_used,
-        "total_connections_recorded": total_connections,
-        "recommendation": "Prefer servers with connection_count=0 (never used) or the lowest count.",
-        "servers": rows,
+        'success': True,
+        'total_connections_recorded': sum(r['connection_count'] for r in used),
+        'used_servers_count': len(used),
+        'storage': str(SERVER_USAGE_FILE),
+        'instruction': (
+            'These servers have been used before. '
+            'When choosing a server from list_vpn_servers, '
+            'AVOID servers appearing in this list (especially those used recently or most often). '
+            'Any server NOT listed here has never been used — prefer those.'
+        ),
+        'used_servers': used,
     }
 
 
@@ -503,9 +500,12 @@ def list_vpn_servers(region: str = "all") -> Dict:
         region_map = {
             "us-east": ["us"],
             "us-west": ["us"],
-            "eu-west": ["uk", "nl", "fr", "pl"],
+            "eu-west": ["gb", "nl", "fr", "pl"],
             "eu-central": ["de", "ch", "at"],
-            "asia-pacific": ["jp", "sg", "au", "hk"]
+            "asia-pacific": ["jp", "sg", "au", "hk"],
+            "africa": ["za", "ng", "ke", "eg"],
+            "south-america": ["br", "ar", "cl", "co"],
+            "middle-east": ["ae", "il", "tr"],
         }
 
         if region != "all":
@@ -600,6 +600,31 @@ def get_vpn_server_status(server_id: str) -> Dict:
             "success": False,
             "error": f"Could not fetch server status: {str(e)}"
         }
+
+
+def _record_server_usage(server_id: str) -> None:
+    """Persist a connection attempt to server_usage.json (creates file if missing)."""
+    import datetime
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data: Dict = {}
+        if SERVER_USAGE_FILE.exists():
+            try:
+                with open(SERVER_USAGE_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+        entry = data.get(server_id, {'count': 0, 'last_used': None, 'first_used': None})
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        entry['count'] += 1
+        entry['last_used'] = now
+        if entry['first_used'] is None:
+            entry['first_used'] = now
+        data[server_id] = entry
+        with open(SERVER_USAGE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass  # Never let tracking errors break the VPN connection
 
 
 def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account: str = None, test_mode: bool = False) -> Dict:
@@ -744,8 +769,8 @@ def connect_to_vpn(server_id: str, protocol: str = "wireguard", mullvad_account:
             "warning": warning
         }
 
-        # Record usage regardless of test_mode so stats stay accurate
-        _record_connection(server_id)
+        # Record usage persistently so it survives log rotation
+        _record_server_usage(server_id)
 
         return {
             "success": True,

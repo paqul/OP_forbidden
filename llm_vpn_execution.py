@@ -73,6 +73,7 @@ available_functions = {
     "connect_to_vpn": vpn_tools.connect_to_vpn,
     "disconnect_vpn": vpn_tools.disconnect_vpn,
     "get_current_connection_info": vpn_tools.get_current_connection_info,
+    "get_server_usage_stats": vpn_tools.get_server_usage_stats,
 }
 
 # Configuration for tool guidance messages (data-driven approach)
